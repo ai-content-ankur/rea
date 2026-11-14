@@ -1,28 +1,27 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import { BrowserScenarioSecrets } from "./BrowserScenarioSecrets.js";
+import { resolveScenarioSecrets } from "../../tests/fixtures/browserScenarioSecrets.js";
 import { browserScenarioSchema } from "../domain/browserScenario.js";
+import { DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS } from "../domain/browserScenarioCaptureLimits.js";
 
 const secret = (secret_id: string) => ({ source: "secret", secret_id });
 const literal = (value: string) => ({
   source: "literal",
   value,
-  classification: "public",
 });
 
 const baseScenario = () => ({
   browser: {
     mode: "launch",
     executable_path: "/opt/chromium/chrome",
-    headless: true,
-    user_data: "temporary-owned",
-    cleanup: "close-and-delete-profile",
   },
   start_url: {
     url: "https://app.example.test/",
     query: [{ name: "token", value: secret("session") }],
   },
-  allowed_origins: ["https://api.example.test", "https://app.example.test"],
   actions: [
     {
       step_id: "login",
@@ -37,7 +36,6 @@ const baseScenario = () => ({
         kind: "role",
         role: "button",
         name: "Sign in",
-        exact: true,
       },
     },
     {
@@ -65,52 +63,20 @@ const baseScenario = () => ({
       },
     ],
   },
-  request_replay: {
-    mode: "exact",
-    unmatched: "abort",
-    routes: [
-      {
-        route_id: "profile",
-        method: "GET",
-        request: { url: "https://api.example.test/profile" },
-        response: {
-          kind: "response",
-          status: 200,
-          headers: [
-            {
-              name: "content-type",
-              value: literal("application/json"),
-            },
-          ],
-          body: literal('{"name":"Ada"}'),
-        },
-      },
-    ],
-  },
   secrets: [
     {
       secret_id: "session",
       environment_variable: "REA_TEST_SESSION",
-      purpose: "input",
-      redaction: "replace-with-secret-reference",
     },
     {
       secret_id: "login_input",
       environment_variable: "REA_TEST_PASSWORD",
-      purpose: "input",
-      redaction: "replace-with-secret-reference",
     },
     {
       secret_id: "cookie",
       environment_variable: "REA_TEST_COOKIE",
-      purpose: "storage",
-      redaction: "replace-with-secret-reference",
     },
   ],
-  redaction: {
-    secret_values: "replace-with-secret-reference",
-    query_parameter_names: ["token"],
-  },
   capture: {
     after_each_step: ["screenshot", "url", "accessibility"],
     at_end: ["dom", "storage"],
@@ -118,13 +84,130 @@ const baseScenario = () => ({
   },
 });
 
+describe("browser scenario secret redaction", () => {
+  it("matches percent-escape hex case without case-folding raw secrets", () => {
+    const secrets = resolveScenarioSecrets(
+      browserScenarioSchema.parse(baseScenario()),
+      {
+        REA_TEST_SESSION: "a/b?",
+        REA_TEST_PASSWORD: "password",
+        REA_TEST_COOKIE: "cookie",
+      },
+    );
+
+    expect(secrets.redact("logged a%2fb%3f, a%2Fb%3F and a%2fb%3F")).toBe(
+      "logged [REDACTED:session], [REDACTED:session] and [REDACTED:session]",
+    );
+    expect(secrets.redact("raw A/B? remains case-sensitive")).toBe(
+      "raw A/B? remains case-sensitive",
+    );
+    expect(
+      Buffer.compare(
+        secrets.redactBytes(
+          Buffer.concat([
+            Buffer.from([0xff, 0]),
+            Buffer.from("a%2fb%3F"),
+            Buffer.from([0x80]),
+          ]),
+        ),
+        Buffer.concat([
+          Buffer.from([0xff, 0]),
+          Buffer.from("[REDACTED:session]"),
+          Buffer.from([0x80]),
+        ]),
+      ),
+    ).toBe(0);
+    expect(
+      secrets.sanitizeUrl("https://app.example.test/?token=a%2fb%3F").url,
+    ).toBe("https://app.example.test/?token=[REDACTED:session]");
+    expect(secrets.fingerprint("stored a%2fb%3F")).toEqual({
+      value_state: "redacted-secret",
+      value_sha256: null,
+    });
+  });
+  it("does not resolve inherited environment properties as secret values", () => {
+    const scenario = browserScenarioSchema.parse(baseScenario());
+    const environment = Object.assign(
+      Object.create({ REA_TEST_SESSION: "session" }) as Record<string, string>,
+      { REA_TEST_PASSWORD: "password", REA_TEST_COOKIE: "cookie" },
+    );
+    expect(BrowserScenarioSecrets.resolve(scenario, environment)).toMatchObject(
+      {
+        ok: false,
+        error: {
+          _tag: "AnalysisInputError",
+          issues: [
+            {
+              path: ["secrets", 0, "environment_variable"],
+              expected: {
+                environment_variable: "REA_TEST_SESSION",
+                secret_id: "session",
+              },
+            },
+          ],
+        },
+      },
+    );
+  });
+});
+
+describe("storage value fingerprint encoding", () => {
+  const secrets = resolveScenarioSecrets(
+    browserScenarioSchema.parse(baseScenario()),
+    {
+      REA_TEST_SESSION: "declared-session",
+      REA_TEST_PASSWORD: "declared-password",
+      REA_TEST_COOKIE: "declared-cookie",
+    },
+  );
+
+  it.each(["", "ordinary", "\u0000", "\u0620", "\ufffd", "\ud83d\ude00"])(
+    "preserves the UTF-8 digest of well-formed %j",
+    (value) => {
+      expect(secrets.fingerprint(value)).toEqual({
+        value_state: "hashed",
+        value_sha256: createHash("sha256").update(value).digest("hex"),
+      });
+    },
+  );
+
+  it.each([
+    ["\ud800", "\ud801"],
+    ["\ud800", "\ufffd"],
+    ["\ud801", "\ufffd"],
+    ["\udc00", "\ufffd"],
+    ["prefix\ud800suffix", "prefix\ud801suffix"],
+    ["\ud800\ud801", "\ud801\ud800"],
+    ["\udc00\ud800", "\ud800\udc00"],
+    // Bare UTF-16LE fallback would alias the UTF-8 bytes 00 d8 a0 00.
+    ["\ud800\u00a0", "\u0000\u0620\u0000"],
+  ])("distinguishes code-unit values %j and %j", (left, right) => {
+    expect(secrets.fingerprint(left).value_sha256).not.toBe(
+      secrets.fingerprint(right).value_sha256,
+    );
+  });
+
+  it("fixes the v2 fallback byte contract to raw FF followed by UTF-16LE", () => {
+    expect(secrets.fingerprint(String.fromCharCode(0xd800, 0x00a0))).toEqual({
+      value_state: "hashed",
+      value_sha256: createHash("sha256")
+        .update(Buffer.from([0xff, 0x00, 0xd8, 0xa0, 0x00]))
+        .digest("hex"),
+    });
+  });
+
+  it("redacts a declared secret before encoding an unpaired suffix", () => {
+    expect(secrets.fingerprint("declared-session\ud800")).toEqual({
+      value_state: "redacted-secret",
+      value_sha256: null,
+    });
+  });
+});
+
 describe("browserScenarioSchema", () => {
   it("accepts and normalizes a declared scenario", () => {
     const parsed = browserScenarioSchema.parse(baseScenario());
-    expect(parsed.allowed_origins).toEqual([
-      "https://api.example.test",
-      "https://app.example.test",
-    ]);
+    expect(parsed.browser).toMatchObject({ mode: "launch", headless: true });
     expect(parsed.environment).toMatchObject({
       viewport: { width: 1_280, height: 720, device_scale_factor: 1 },
       locale: "en-US",
@@ -133,23 +216,27 @@ describe("browserScenarioSchema", () => {
       reduced_motion: "reduce",
       service_workers: "block",
     });
-    expect(parsed.request_replay).toEqual({
-      mode: "exact",
-      unmatched: "abort",
-      routes: expect.any(Array),
-    });
     expect(parsed.capture).toEqual({
+      limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
+      network: {
+        request_body: false,
+        response_body: false,
+        header_values: false,
+      },
       after_each_step: ["screenshot", "url", "accessibility"],
       at_end: ["dom", "storage"],
       events: ["console", "page-errors", "network", "websockets"],
     });
-    expect(parsed.redaction.header_names).toEqual([
-      "authorization",
-      "cookie",
-      "proxy-authorization",
-      "set-cookie",
-    ]);
-    expect(parsed).not.toHaveProperty("limits");
+  });
+
+  it("allows callers to choose visible browsers and service workers", () => {
+    const parsed = browserScenarioSchema.parse({
+      ...baseScenario(),
+      browser: { ...baseScenario().browser, headless: false },
+      environment: { service_workers: "allow" },
+    });
+    expect(parsed.browser).toMatchObject({ headless: false });
+    expect(parsed.environment.service_workers).toBe("allow");
   });
 
   it("accepts caller selected action timeouts without a fixed ceiling", () => {
@@ -176,12 +263,59 @@ describe("browserScenarioSchema", () => {
 
   it("redacts overlapping secrets longest-first", () => {
     const scenario = browserScenarioSchema.parse(baseScenario());
-    const secrets = BrowserScenarioSecrets.resolve(scenario, {
+    const secrets = resolveScenarioSecrets(scenario, {
       REA_TEST_SESSION: "prefix",
       REA_TEST_PASSWORD: "prefix-suffix",
       REA_TEST_COOKIE: "cookie",
     });
-    expect(secrets?.redact("prefix-suffix")).toBe("[REDACTED:login_input]");
+    expect(secrets.redact("prefix-suffix")).toBe("[REDACTED:login_input]");
+  });
+
+  it("does not leave a declared secret inside its redaction marker", () => {
+    const secrets = resolveScenarioSecrets(
+      browserScenarioSchema.parse({
+        ...baseScenario(),
+        secrets: [
+          ...baseScenario().secrets,
+          {
+            secret_id: "password",
+            environment_variable: "REA_TEST_SHORT_PASSWORD",
+          },
+        ],
+      }),
+      {
+        REA_TEST_SESSION: "prefix",
+        REA_TEST_PASSWORD: "prefix-suffix",
+        REA_TEST_COOKIE: "cookie",
+        REA_TEST_SHORT_PASSWORD: "pass",
+      },
+    );
+    expect(secrets.redact("seen pass in the page")).toBe(
+      "seen [REDACTED] in the page",
+    );
+
+    const bytes = resolveScenarioSecrets(
+      browserScenarioSchema.parse({
+        ...baseScenario(),
+        secrets: [
+          ...baseScenario().secrets,
+          {
+            secret_id: "password",
+            environment_variable: "REA_TEST_LONG_SECRET",
+          },
+          { secret_id: "pin", environment_variable: "REA_TEST_PIN" },
+        ],
+      }),
+      {
+        REA_TEST_SESSION: "prefix",
+        REA_TEST_PASSWORD: "prefix-suffix",
+        REA_TEST_COOKIE: "cookie",
+        REA_TEST_LONG_SECRET: "session-secret-value",
+        REA_TEST_PIN: "pass",
+      },
+    ).redactBytes(Buffer.from("body session-secret-value tail"));
+    expect(bytes.toString("utf8")).toBe("body [REDACTED] tail");
+    expect(bytes.includes(Buffer.from("pass"))).toBe(false);
   });
 
   it("rejects unsupported actions", () => {
@@ -196,45 +330,19 @@ describe("browserScenarioSchema", () => {
     expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
   });
 
-  it("rejects every undeclared navigation, storage, and replay origin", () => {
-    for (const mutate of [
-      (scenario: ReturnType<typeof baseScenario>) => {
-        scenario.start_url.url = "https://other.example.test/";
-      },
-      (scenario: ReturnType<typeof baseScenario>) => {
-        scenario.actions[2] = {
-          ...scenario.actions[2],
-          destination: { url: "https://other.example.test/" },
-        } as never;
-      },
-      (scenario: ReturnType<typeof baseScenario>) => {
-        scenario.storage.local_storage[0]!.origin =
-          "https://other.example.test";
-      },
-      (scenario: ReturnType<typeof baseScenario>) => {
-        scenario.request_replay.routes[0]!.request.url =
-          "https://other.example.test/data";
-      },
-    ]) {
-      const scenario = baseScenario();
-      mutate(scenario);
-      expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
-    }
+  it("accepts explicitly selected navigation and storage origins without an allowlist", () => {
+    const scenario = baseScenario();
+    scenario.actions[2] = {
+      ...scenario.actions[2],
+      destination: { url: "https://other.example.test/" },
+    } as never;
+    scenario.storage.local_storage[0]!.origin = "https://storage.example.test";
+    expect(browserScenarioSchema.safeParse(scenario).success).toBe(true);
   });
 });
 
-describe("browserScenarioSchema credential handling", () => {
-  it("rejects redirects outside declared origins", () => {
-    const scenario = baseScenario();
-    scenario.request_replay.routes[0]!.response = {
-      kind: "redirect",
-      status: 302,
-      destination: { url: "https://other.example.test/" },
-    } as never;
-    expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
-  });
-
-  it("rejects missing, duplicate, and unused secret declarations", () => {
+describe("browserScenarioSchema secret declarations", () => {
+  it("rejects missing and duplicate secret declarations but accepts redaction-only declarations", () => {
     const missing = baseScenario();
     missing.secrets = missing.secrets.filter(
       ({ secret_id }) => secret_id !== "login_input",
@@ -246,43 +354,30 @@ describe("browserScenarioSchema credential handling", () => {
     expect(browserScenarioSchema.safeParse(duplicate).success).toBe(false);
 
     const unused = baseScenario();
-    unused.secrets.push({
+    const redactionOnly = {
       secret_id: "unused",
-      environment_variable: "REA_TEST_UNUSED",
-      purpose: "input",
-      redaction: "replace-with-secret-reference",
-    });
+      environment_variable: "rea.test-unused",
+    };
+    unused.secrets.push(redactionOnly);
+    expect(browserScenarioSchema.safeParse(unused).success).toBe(true);
+
+    redactionOnly.environment_variable = "INVALID=NAME";
+    expect(browserScenarioSchema.safeParse(unused).success).toBe(false);
+    redactionOnly.environment_variable = "INVALID\0NAME";
     expect(browserScenarioSchema.safeParse(unused).success).toBe(false);
   });
 
-  it("rejects secret query values without named redaction", () => {
-    const scenario = baseScenario();
-    scenario.redaction.query_parameter_names = [];
-    expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
-  });
-
-  it("rejects literal credential headers and provider-owned headers", () => {
-    for (const name of ["authorization", "content-length"]) {
-      const scenario = baseScenario();
-      scenario.request_replay.routes[0]!.response = {
-        kind: "response",
-        status: 200,
-        headers: [{ name, value: literal("raw") }],
-      } as never;
-      expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
-    }
-  });
-
-  it("rejects duplicate replay response headers case-insensitively", () => {
-    const scenario = baseScenario();
-    const response = scenario.request_replay.routes[0]!.response;
-    if (response.kind !== "response")
-      throw new Error("Expected replay response fixture");
-    response.headers.push({
-      name: "Content-Type",
-      value: literal("text/plain"),
-    });
-    expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
+  it("rejects removed replay and origin policy options", () => {
+    for (const legacyField of [
+      { request_replay: { mode: "disabled" } },
+      { allowed_origins: ["https://app.example.test"] },
+    ])
+      expect(
+        browserScenarioSchema.safeParse({
+          ...baseScenario(),
+          ...legacyField,
+        }).success,
+      ).toBe(false);
   });
 
   it("rejects raw secret-shaped action values", () => {
@@ -294,31 +389,41 @@ describe("browserScenarioSchema credential handling", () => {
     expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
   });
 
-  it("rejects embedded URL credentials and query values", () => {
+  it("preserves inline URL queries and fragments but rejects userinfo", () => {
     const credentialedUrl = new URL("https://app.example.test/");
     credentialedUrl.username = String.fromCodePoint(120);
-    for (const url of [
-      credentialedUrl.href,
-      "https://app.example.test/?token=raw",
-    ]) {
-      const scenario = baseScenario();
-      scenario.start_url.url = url;
-      expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
-    }
+    const invalid = baseScenario();
+    invalid.start_url.url = credentialedUrl.href;
+    expect(browserScenarioSchema.safeParse(invalid).success).toBe(false);
+
+    const scenario = baseScenario();
+    scenario.start_url.url = "https://app.example.test/?q=one&q=two#section";
+    scenario.start_url.query = [];
+    scenario.secrets = scenario.secrets.filter(
+      ({ secret_id }) => secret_id !== "session",
+    );
+    const parsed = browserScenarioSchema.parse(scenario);
+    expect(parsed.start_url.url).toBe(
+      "https://app.example.test/?q=one&q=two#section",
+    );
   });
 
-  it("requires explicit external ownership for CDP connections", () => {
-    const scenario = baseScenario();
-    scenario.browser = {
-      mode: "connect",
-      cdp_endpoint: "http://127.0.0.1:9222",
-      target_id: "page-1",
-      ownership: "external",
-      cleanup: "disconnect-only",
-    } as never;
+  it("derives external ownership from CDP connection mode", () => {
+    const scenario = {
+      ...baseScenario(),
+      browser: {
+        mode: "connect",
+        cdp_endpoint: "http://127.0.0.1:9222",
+        target_id: "page-1",
+      },
+    };
     expect(browserScenarioSchema.safeParse(scenario).success).toBe(true);
 
-    scenario.browser.cleanup = "close-browser" as never;
-    expect(browserScenarioSchema.safeParse(scenario).success).toBe(false);
+    expect(
+      browserScenarioSchema.safeParse({
+        ...scenario,
+        browser: { ...scenario.browser, cleanup: "close-browser" },
+      }).success,
+    ).toBe(false);
   });
 });

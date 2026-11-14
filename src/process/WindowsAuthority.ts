@@ -1,8 +1,10 @@
-/**
- * Provider-neutral security controls that require a verified Windows native
- * authority. Runtime probes and POSIX permissions do not satisfy these
- * controls.
- */
+import {
+  systemWindowsNativeAuthority,
+  windowsNativeFailureRemediation,
+  type WindowsNativeLoadResult,
+} from "../windows/WindowsNativeLoader.js";
+
+/** Windows controls are proven by the packaged native boundary, not POSIX flags. */
 export type WindowsNativeCapability =
   | {
       readonly available: true;
@@ -13,6 +15,16 @@ export type WindowsNativeCapability =
       readonly available: false;
       readonly reason: string;
       readonly proof: "not-proven" | "not-applicable";
+      readonly retryable?: true;
+      readonly code:
+        | "unsupported_host"
+        | "runtime_missing"
+        | "runtime_unavailable";
+      readonly failureStage: Exclude<
+        WindowsNativeLoadResult,
+        { available: true }
+      >["failureStage"];
+      readonly remediation: string;
     };
 
 /** Security controls required before REA may claim Windows isolation. */
@@ -22,9 +34,57 @@ export interface WindowsNativeCapabilitySet {
   readonly reparse_safe_path_admission: WindowsNativeCapability;
 }
 
-/** Stable explanation used whenever the native Windows authority is absent. */
-export const WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON =
-  "Verified Windows native authority is unavailable: Job Object process ownership, private runtime DACL enforcement, and reparse-safe path admission are not implemented; chmod(0700) is insufficient for Windows private DACL proof, and taskkill is not a Job Object security proof";
+/** One readiness observation, shared by diagnostics and security controls. */
+export type WindowsNativeReadiness =
+  | { readonly available: true }
+  | {
+      readonly available: false;
+      readonly reason: string;
+      readonly failureStage: Exclude<
+        WindowsNativeLoadResult,
+        { available: true }
+      >["failureStage"];
+      readonly code:
+        | "unsupported_host"
+        | "runtime_missing"
+        | "runtime_unavailable";
+      readonly retryable?: true;
+      readonly remediation: string;
+      readonly proof: "not-proven" | "not-applicable";
+    };
+
+/** Interpret the loader's tagged failure without guessing from OS error text. */
+export const inspectWindowsNativeReadiness = (
+  platform: NodeJS.Platform,
+  observation?: WindowsNativeLoadResult,
+): WindowsNativeReadiness => {
+  if (platform !== "win32")
+    return {
+      available: false,
+      failureStage: "host",
+      reason: "Windows native authority is not applicable on this host",
+      proof: "not-applicable",
+      code: "unsupported_host",
+      remediation: "Use a Windows x64 host for Windows native controls.",
+    };
+  const loaded = observation ?? systemWindowsNativeAuthority();
+  if (loaded.available) return { available: true };
+  const failureStage = loaded.failureStage;
+  return {
+    available: false,
+    failureStage,
+    reason: loaded.reason,
+    ...(loaded.retryable === true ? { retryable: true as const } : {}),
+    proof: "not-proven",
+    code:
+      failureStage === "host"
+        ? "unsupported_host"
+        : failureStage === "artifact" || failureStage === "load"
+          ? "runtime_missing"
+          : "runtime_unavailable",
+    remediation: windowsNativeFailureRemediation(failureStage),
+  };
+};
 
 /**
  * Describe native Windows controls without inferring them from taskkill,
@@ -32,34 +92,22 @@ export const WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON =
  */
 export const windowsNativeCapabilities = (
   platform: NodeJS.Platform,
+  readiness: WindowsNativeReadiness = inspectWindowsNativeReadiness(platform),
 ): WindowsNativeCapabilitySet => {
-  if (platform !== "win32") {
-    const notApplicable = {
-      available: false,
-      reason: "Windows native authority is not applicable on this host",
-      proof: "not-applicable",
-    } as const;
-    return {
-      job_object_process_ownership: notApplicable,
-      private_runtime_dacl: notApplicable,
-      reparse_safe_path_admission: notApplicable,
-    };
-  }
-
-  const notProven = {
-    available: false,
-    reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
-    proof: "not-proven",
-  } as const;
+  const capability = readiness.available
+    ? ({ available: true, reason: null, proof: "native-authority" } as const)
+    : ({
+        available: false,
+        reason: readiness.reason,
+        proof: readiness.proof,
+        code: readiness.code,
+        failureStage: readiness.failureStage,
+        remediation: readiness.remediation,
+        ...(readiness.retryable === true ? { retryable: true as const } : {}),
+      } as const);
   return {
-    job_object_process_ownership: notProven,
-    private_runtime_dacl: notProven,
-    reparse_safe_path_admission: notProven,
+    job_object_process_ownership: capability,
+    private_runtime_dacl: capability,
+    reparse_safe_path_admission: capability,
   };
 };
-
-/** Whether every native control needed for Windows isolation is proven. */
-export const hasWindowsNativeAuthority = (platform: NodeJS.Platform): boolean =>
-  Object.values(windowsNativeCapabilities(platform)).every(
-    ({ available }) => available,
-  );

@@ -1,14 +1,67 @@
-import { execFile } from "node:child_process";
-import { rm } from "node:fs/promises";
-import { promisify } from "node:util";
-
+import { createVerifierCommands } from "../../../scripts/lib/verify-commands.mjs";
+import { withVerifierCleanup } from "../../../scripts/lib/verifier-cleanup.mjs";
+import {
+  access,
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { spawn } from "@lydell/node-pty";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
+import { z } from "zod";
+import { parse as parseToml } from "smol-toml";
 
+import { manualRegistrationRemediation } from "../../../src/application/SupportedClients.js";
+import type { SetupResult } from "../../../src/application/SetupTypes.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { cliTest, type TestCli } from "../../support/cli/cliFixture.js";
 
-const execute = promisify(execFile);
+const execute = async (
+  command: string,
+  arguments_: readonly string[],
+  options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv },
+) => {
+  const commands = await createVerifierCommands();
+  onTestFinished(() => commands.close());
+  return withVerifierCleanup(
+    () => commands.exec(command, arguments_, { ...options, timeout: 15_000 }),
+    [() => commands.close()],
+  );
+};
 const decisionMarker = "REA_SETUP_DECISION:";
+const isolatedSetupEnvironment = (home: string) => ({
+  HOME: home,
+  USERPROFILE: home,
+  CODEX_HOME: join(home, ".codex"),
+  XDG_CONFIG_HOME: join(home, ".config"),
+  XDG_DATA_HOME: join(home, ".local", "share"),
+  XDG_CACHE_HOME: join(home, ".cache"),
+});
+const runSetup = (cli: TestCli, home: string, dryRun: string) =>
+  cli.run({
+    arguments: [
+      "setup",
+      "--yes",
+      "--client",
+      "codex",
+      "--skill=false",
+      dryRun,
+      "--format",
+      "json",
+    ],
+    cwd: home,
+    environment: isolatedSetupEnvironment(home),
+  });
+const decisionSchema = z.object({
+  approved: z.boolean(),
+  selectedActionIds: z.array(z.string()),
+  cancelled: z.boolean().optional(),
+});
 
 const actions = [
   {
@@ -40,233 +93,707 @@ const actions = [
   },
 ] as const;
 
-describe("interactive setup journey", () => {
-  it("leads with value, a compact detected-target summary, and durable key help", async () => {
-    const result = await runJourney([
-      step("What should REA set up?", "\u0003"),
+const clientStates = [
+  {
+    client: {
+      name: "codex",
+      format: "toml",
+      configPath: [".codex", "config.toml"],
+      marker: [".codex"],
+    },
+    detected: true,
+    configured: false,
+    status: "needs_configuration",
+  },
+  {
+    client: {
+      name: "opencode",
+      format: "opencode",
+      configPath: [".config", "opencode", "opencode.json"],
+      marker: [".config", "opencode"],
+    },
+    detected: false,
+    configured: false,
+    status: "missing",
+  },
+] as const;
+
+const agentActions = actions.filter(({ kind }) => kind !== "install_hopper");
+
+cliTest.for([
+  "--dry-run=abc",
+  "--dry-run=",
+  "--dryRun=abc",
+  "--dry-run=ab\ncd",
+] as const)(
+  "rejects malformed setup dry-run value %s before approved changes are written",
+  async (dryRun, { cli }) => {
+    const home = await createTestTempDirectory("rea-cli-invalid-dry-run-");
+    const config = join(home, ".codex", "config.toml");
+    const result = await runSetup(cli, home, dryRun);
+
+    await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(result.exitCode).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("--dry-run");
+  },
+);
+
+cliTest.for(["--dry-run=true", "--dry-run=false"] as const)(
+  "accepts explicit setup dry-run value %s",
+  async (dryRun, { cli }) => {
+    const home = await createTestTempDirectory("rea-cli-explicit-dry-run-");
+    const config = join(home, ".codex", "config.toml");
+    const result = await runSetup(cli, home, dryRun);
+
+    expect(result.exitCode, result.stderr).toBe(0);
+    if (dryRun === "--dry-run=true") {
+      expect(result.json).toMatchObject({ status: "planned" });
+      await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect(result.json).toMatchObject({ status: "ready" });
+      await expect(access(config)).resolves.toBeUndefined();
+    }
+  },
+);
+
+cliTest(
+  "reports invalid dry-run through the public CLI without a stack trace",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory(
+      "rea-cli-public-invalid-dry-run-",
+    );
+    const config = join(home, ".codex", "config.toml");
+    const result = await runSetup(cli, home, "--dry-run=abc");
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.json).toMatchObject({ code: "PARSE_ERROR" });
+    expect(result.stdout).toContain("--dry-run");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain(
+      "Incur.ParseError",
+    );
+    await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
+  },
+);
+
+cliTest(
+  "shows setup help even when a malformed dry-run value is present",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory("rea-cli-help-invalid-dry-run-");
+    const config = join(home, ".codex", "config.toml");
+    const result = await cli.run({
+      arguments: ["setup", "--dry-run=abc", "--help"],
+      cwd: home,
+      environment: isolatedSetupEnvironment(home),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Usage: rea setup");
+    expect(result.stdout).not.toContain("Invalid --dry-run value");
+    await expect(access(config)).rejects.toMatchObject({ code: "ENOENT" });
+  },
+);
+
+cliTest(
+  "rejects an overridden malformed dry-run before changing existing Codex configuration",
+  async ({ cli }) => {
+    const selectedHome = await createTestTempDirectory(
+      "rea-cli-existing-dry-run-",
+    );
+    const config = join(selectedHome, ".codex", "config.toml");
+    const original = 'model = "retained-evidence"\n';
+    await mkdir(dirname(config), { recursive: true });
+    await writeFile(config, original);
+    const before = await lstat(config);
+    const result = await cli.run({
+      arguments: [
+        "setup",
+        "--yes",
+        "--client",
+        "codex",
+        "--skill=false",
+        "--dry-run=abc",
+        "--dryRun=false",
+        "--json",
+      ],
+      cwd: selectedHome,
+      environment: isolatedSetupEnvironment(selectedHome),
+    });
+    expect(result.exitCode, result.stderr).toBe(1);
+    expect(result.json).toMatchObject({ code: "PARSE_ERROR" });
+    expect(await readFile(config, "utf8")).toBe(original);
+    expect((await lstat(config)).mtimeMs).toBe(before.mtimeMs);
+    expect(await readdir(dirname(config))).toEqual(["config.toml"]);
+  },
+);
+
+const runSetupInTty = async (
+  home: string,
+  arguments_: readonly string[],
+  approval?: boolean,
+  environment: NodeJS.ProcessEnv = {},
+): Promise<{ readonly exitCode: number; readonly output: string }> => {
+  const terminal = spawn(
+    process.execPath,
+    ["scripts/rea.mjs", "setup", ...arguments_],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        HOME: home,
+        USERPROFILE: home,
+        XDG_CONFIG_HOME: join(home, ".config"),
+        REA_LOG_LEVEL: "silent",
+        NO_COLOR: "1",
+        ...environment,
+      },
+      name: "xterm-256color",
+      cols: 120,
+      rows: 40,
+    },
+  );
+  let output = "";
+  let answered = false;
+  terminal.onData((data) => {
+    output += data;
+    if (
+      approval !== undefined &&
+      !answered &&
+      output.includes("Apply this change?")
+    ) {
+      answered = true;
+      terminal.write(approval ? "\r" : "\u001b[C\r");
+    }
+  });
+  const exitCode = await new Promise<number>((resolvePromise, reject) => {
+    const timeout = setTimeout(() => {
+      terminal.kill();
+      reject(new Error(`TTY setup timed out after output:\n${output}`));
+    }, 15_000);
+    terminal.onExit(({ exitCode: code }) => {
+      clearTimeout(timeout);
+      resolvePromise(code);
+    });
+  });
+  return { exitCode, output };
+};
+
+const manualConnectorFixture = async (): Promise<{
+  readonly home: string;
+  readonly environment: NodeJS.ProcessEnv;
+}> => {
+  const home = await createTestTempDirectory("rea-cli-setup-manual-");
+  const bin = join(home, "bin");
+  await mkdir(bin);
+  const hopper = join(bin, "hopper");
+  await writeFile(hopper, "#!/bin/sh\necho 'Hopper Disassembler v6.0.0'\n", {
+    mode: 0o755,
+  });
+  // Linux's executable probe runs ldd before accepting this inert launcher.
+  await writeFile(join(bin, "ldd"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  for (const runner of ["npx", "npm", "bun"])
+    await writeFile(join(bin, runner), "#!/bin/sh\nexit 99\n", {
+      mode: 0o755,
+    });
+  return {
+    home,
+    environment: {
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      HOPPER_LAUNCHER_PATH: hopper,
+      DSH_HOME: join(home, ".dsh"),
+      DSH_AGENTS_HOME: join(home, ".dsh-agents"),
+      XDG_DATA_HOME: join(home, ".local/share"),
+      XDG_CACHE_HOME: join(home, ".cache"),
+      XDG_STATE_HOME: join(home, ".local/state"),
+    },
+  };
+};
+
+describe("manual connector approval", () => {
+  it.skipIf(process.platform === "win32").each([true, false])(
+    "discloses the manual step before approval (apply: %s)",
+    async (approved) => {
+      const { home, environment } = await manualConnectorFixture();
+      const { output, exitCode } = await runSetupInTty(
+        home,
+        ["--client", "grok_bot"],
+        approved,
+        environment,
+      );
+      const prompt = output.indexOf("Apply this change?");
+      const remediation = manualRegistrationRemediation("grok_bot");
+      expect(remediation).toBeDefined();
+      expect(prompt, output).toBeGreaterThan(0);
+      expect(output.slice(0, prompt)).toContain(remediation);
+      const skill = join(
+        home,
+        ".agents/skills/reverse-engineer-anything/SKILL.md",
+      );
+      if (approved) {
+        expect(exitCode, output).toBe(1);
+        expect(await readFile(skill, "utf8")).not.toBe("");
+      } else {
+        expect(exitCode, output).toBe(0);
+        await expect(access(skill)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "shows the manual step in a TTY dry run",
+    async () => {
+      const { home, environment } = await manualConnectorFixture();
+      const { output, exitCode } = await runSetupInTty(
+        home,
+        ["--dry-run", "--client", "grok_bot"],
+        undefined,
+        environment,
+      );
+      const remediation = manualRegistrationRemediation("grok_bot");
+      expect(remediation).toBeDefined();
+      expect(exitCode, output).toBe(0);
+      expect(output).toContain(remediation);
+      expect(output).toContain("Dry run complete. No changes were made.");
+    },
+  );
+});
+
+describe("TTY setup dry run", () => {
+  it("prints the plan and no-mutation notice for a TTY dry run", async () => {
+    const home = await createTestTempDirectory("rea-cli-setup-dry-run-");
+    const { exitCode, output } = await runSetupInTty(home, [
+      "--dry-run",
+      "--client",
+      "codex",
+      "--skill=false",
     ]);
 
-    expect(result.output).toContain(
-      "Understand local apps and binaries from your coding agent.",
-    );
-    expect(result.output).toContain(
-      "Trace how a feature works with local evidence.",
-    );
-    expect(result.output).toContain("Found 1 supported agent");
-    expect(result.output).toContain("Codex");
-    expect(result.output).toContain("Hopper deep-analysis provider (provider)");
-    expect(result.output).toContain(
-      "Agent integration (MCP + guided workflow)",
-    );
-    expect(result.output).toContain(
-      "Keys: ↑/↓ navigate · Space toggle · Enter confirm · Ctrl-C cancel",
-    );
-    expect(result.decision.approved).toBe(false);
-  });
-
-  it("allows deselecting the pre-selected agent integration to opt out", async () => {
-    const result = await runJourney([step("What should REA set up?", " \r")]);
-
-    expect(result.output).toContain(
-      "Agent integration (MCP + guided workflow)",
-    );
-    expect(result.output).not.toContain(
-      "REA reverse-engineering skill (skill)",
-    );
-    expect(result.output).toContain("Hopper deep-analysis provider (provider)");
-    expect(result.output).not.toContain("Ready to review");
-    expect(result.output).toContain("Nothing selected. No changes were made.");
-    expect(result.decision).toEqual({
-      approved: false,
-      selectedActionIds: [],
+    expect(exitCode, output).toBe(0);
+    expect(output).toContain("CREATE  Codex");
+    expect(output).toContain(join(home, ".codex/config.toml"));
+    expect(output).toContain("Dry run complete. No changes were made.");
+    await expect(
+      access(join(home, ".codex/config.toml")),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
     });
   });
 
-  it("pre-selects agent integration and proceeds to the agent picker on Enter", async () => {
-    const result = await runJourney([
-      step("What should REA set up?", "\r"),
-      step("Which agents should use REA?", "\u0003"),
+  it("shows the refusal instead of a blocked skill plan for a TTY dry run", async () => {
+    const home = await createTestTempDirectory("rea-cli-setup-linked-dry-run-");
+    const managed = join(home, "managed-skill");
+    const linked = join(home, ".claude/skills/reverse-engineer-anything");
+    const original = "user-managed skill bytes\n";
+    await mkdir(managed);
+    await writeFile(join(managed, "SKILL.md"), original);
+    await mkdir(dirname(linked), { recursive: true });
+    await symlink(
+      managed,
+      linked,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const { exitCode, output } = await runSetupInTty(home, [
+      "--dry-run",
+      "--client",
+      "claude_code",
     ]);
 
-    expect(result.output).toContain("Codex (detected)");
-    expect(result.output).toContain("Setup cancelled. No changes were made.");
-    expect(result.decision.approved).toBe(false);
-  });
-
-  it("offers one bundled repair when MCP is aligned but the skill is missing", async () => {
-    const result = await runJourney(
-      [step("What should REA set up?", "\r"), step("Apply this change?", "\r")],
-      false,
-      actions.filter(({ kind }) => kind !== "configure_client"),
-    );
-
-    expect(result.output).toContain("No agent integrations need configuration");
-    expect(result.output).toContain(
-      "Agent integration (MCP + guided workflow)",
-    );
-    expect(result.output).not.toContain(
-      "REA reverse-engineering skill (skill)",
-    );
-    expect(result.output).toContain("INSTALL  REA reverse-engineering skill");
-    expect(result.output).not.toContain("CREATE  Codex");
-    expect(result.output).not.toContain(
-      "INSTALL  Hopper deep-analysis provider",
-    );
-    expect(result.decision).toEqual({
-      approved: true,
-      selectedActionIds: ["install_skill"],
+    expect(exitCode, output).toBe(1);
+    expect(output).toContain("Skill directory is a symbolic link.");
+    expect(output).toContain(linked);
+    expect(output).toContain("--skill=false");
+    expect(output).not.toContain("REA setup plan");
+    expect(output).not.toContain("Install or update the REA skill");
+    expect((await lstat(linked)).isSymbolicLink()).toBe(true);
+    expect(await readFile(join(managed, "SKILL.md"), "utf8")).toBe(original);
+    expect(await readdir(managed)).toEqual(["SKILL.md"]);
+    await expect(access(join(home, ".claude.json"))).rejects.toMatchObject({
+      code: "ENOENT",
     });
-  });
-
-  it("pre-selects all detected agents in the agent picker", async () => {
-    const result = await runJourney(
-      [
-        step("What should REA set up?", "\r"),
-        step("Which agents should use REA?", "\u0003"),
-      ],
-      false,
-      [
-        actions[0],
-        {
-          ...actions[0],
-          id: "configure_client:cursor",
-          label: "Cursor",
-          target: "/isolated/.cursor/mcp.json",
-        },
-        ...actions.slice(1),
-      ],
-    );
-
-    expect(result.output).toContain("Codex (detected)");
-    expect(result.output).toContain("Cursor (detected)");
-    expect(result.decision.approved).toBe(false);
   });
 });
 
-describe("interactive setup selection and confirmation", () => {
-  it("retains the bundled skill even when all agents are deselected (#399)", async () => {
-    const result = await runJourney([
-      step("What should REA set up?", "\r"),
-      step("Which agents should use REA?", " \r"),
-      step("Apply this change?", "\r"),
-    ]);
+cliTest.skipIf(process.platform === "win32")(
+  "repairs a Codex timeout without replacing an equivalent caller-selected launcher",
+  async ({ cli }) => {
+    const home = await createTestTempDirectory("rea-codex-alias-repair-");
+    const codexHome = join(home, ".codex");
+    const config = join(codexHome, "config.toml");
+    const backup = `${config}.rea.backup`;
+    const alias = join(home, "rea-launcher-alias.mjs");
+    await mkdir(codexHome);
+    await symlink(resolve("scripts/rea.mjs"), alias, "file");
+    const original = [
+      "# Caller-owned Codex approval policy",
+      'approval_policy = "on-request"',
+      'sandbox_mode = "read-only"',
+      "",
+      "[mcp_servers.rea]",
+      `command = ${JSON.stringify(process.execPath)}`,
+      `args = ${JSON.stringify([alias, "mcp"])}`,
+      "startup_timeout_sec = 0",
+      "tool_timeout_sec = 900",
+      'default_tools_approval_mode = "prompt"',
+      "",
+      "[mcp_servers.rea.tools.open_binary]",
+      'approval_mode = "approve"',
+      "output_token_limit = 2048",
+      "",
+    ].join("\n");
+    await writeFile(config, original);
+    const setup = (approval: "--dry-run" | "--yes") =>
+      cli.run({
+        arguments: [
+          "setup",
+          "--client",
+          "codex",
+          "--no-skill",
+          approval,
+          "--json",
+        ],
+        cwd: home,
+        environment: {
+          HOME: home,
+          USERPROFILE: home,
+          CODEX_HOME: codexHome,
+          XDG_CONFIG_HOME: join(home, ".config"),
+          XDG_DATA_HOME: join(home, ".local", "share"),
+          XDG_CACHE_HOME: join(home, ".cache"),
+        },
+      });
 
-    expect(result.output).toContain("Ready to review");
-    expect(result.output).toContain("INSTALL  REA reverse-engineering skill");
-    expect(result.output).not.toContain("CREATE  Codex");
-    expect(result.decision).toEqual({
-      approved: true,
-      selectedActionIds: ["install_skill"],
+    const planned = await setup("--dry-run");
+    expect(planned.exitCode, planned.stderr).toBe(0);
+    expect(planned.json).toMatchObject({
+      status: "planned",
+      plannedActions: [
+        expect.objectContaining({
+          id: "configure_client:codex",
+          operation: "update",
+          target: config,
+          backupPath: backup,
+        }),
+      ],
     });
-  });
+    expect(await readFile(config, "utf8")).toBe(original);
+    await expect(access(backup)).rejects.toMatchObject({ code: "ENOENT" });
 
-  it("defaults the final confirmation to Yes, apply", async () => {
-    const result = await runJourney([
-      step("What should REA set up?", "\r"),
-      step("Which agents should use REA?", "\r"),
-      step("Apply these 2 changes?", "\r"),
-    ]);
-
-    expect(result.output).toContain("Ready to review");
-    expect(result.output).toContain("CREATE  Codex");
-    expect(result.output).toContain("/isolated/.codex/config.toml");
-    expect(result.output).toContain("INSTALL  REA reverse-engineering skill");
-    expect(result.output).not.toContain(
-      "INSTALL  Hopper deep-analysis provider",
-    );
-    expect(result.output).toContain("Yes, apply");
-    expect(result.decision).toEqual({
-      approved: true,
-      selectedActionIds: ["configure_client:codex", "install_skill"],
+    const applied = await setup("--yes");
+    expect(applied.exitCode, applied.stderr).toBe(0);
+    expect(applied.json).toMatchObject({ status: "ready" });
+    const repaired = await readFile(config, "utf8");
+    expect(parseToml(repaired)).toMatchObject({
+      approval_policy: "on-request",
+      sandbox_mode: "read-only",
+      mcp_servers: {
+        rea: {
+          command: process.execPath,
+          args: [alias, "mcp"],
+          startup_timeout_sec: 30,
+          tool_timeout_sec: 900,
+          default_tools_approval_mode: "prompt",
+          tools: {
+            open_binary: { approval_mode: "approve", output_token_limit: 2048 },
+          },
+        },
+      },
     });
-  });
+    expect(await readFile(backup, "utf8")).toBe(original);
+    expect((await lstat(alias)).isSymbolicLink()).toBe(true);
 
-  it("can still be cancelled at the final confirmation", async () => {
-    const result = await runJourney([
-      step("What should REA set up?", "\r"),
-      step("Which agents should use REA?", "\r"),
-      step("Apply these 2 changes?", "\u001b[D\r"),
-    ]);
-
-    expect(result.output).toContain("Ready to review");
-    expect(result.output).toContain("Setup cancelled. No changes were made.");
-    expect(result.decision).toEqual({
-      approved: false,
-      selectedActionIds: ["configure_client:codex", "install_skill"],
+    const repeated = await setup("--yes");
+    expect(repeated.exitCode, repeated.stderr).toBe(0);
+    expect(repeated.json).toMatchObject({
+      status: "ready",
+      plannedActions: [],
+      appliedActions: [],
     });
-  });
+    expect(await readFile(config, "utf8")).toBe(repaired);
+    expect(await readFile(backup, "utf8")).toBe(original);
+  },
+);
 
-  it("defaults accessible agent integration to Yes and others to No", async () => {
+describe("interactive setup journey", () => {
+  it("shows detected and absent clients without preselecting detected clients", async () => {
     const result = await runJourney(
       [
-        step("Set up Agent integration (MCP + guided workflow)?", "\r"),
-        step("Set up Hopper deep-analysis provider (provider)?", "\r"),
+        step("Which agents should use REA?", "\u001b[B"),
+        step("Not detected · configuration is still available", "\r"),
+      ],
+      false,
+      [actions[0]],
+    );
+    expect(result.output).toContain("Detected: Codex");
+    expect(result.output).toContain(
+      "Not detected · configuration is still available",
+    );
+    expect(result.output).toContain("Which agents should use REA?");
+    expect(result.output).not.toContain("What should REA set up?");
+    expect(result.decision.selectedActionIds).toEqual([]);
+  });
+
+  it("selects an absent OpenCode client and bundles its skill", async () => {
+    const result = await runJourney(
+      [
+        step("Which agents should use REA?", "\u001b[B \r"),
+        step("Apply these 2 changes?", "\r"),
+      ],
+      false,
+      [
+        {
+          ...actions[0],
+          id: "configure_client:opencode",
+          label: "OpenCode",
+          target: "/isolated/.config/opencode/opencode.json",
+        },
+        actions[1],
+      ],
+    );
+    expect(result.output).toContain("CREATE  OpenCode");
+    expect(result.decision.selectedActionIds).toEqual([
+      "configure_client:opencode",
+      "install_skill",
+    ]);
+    expect(result.decision.approved).toBe(true);
+  });
+
+  it("shows the launcher, backup, and path before final approval", async () => {
+    const result = await runJourney(
+      [
+        step("Which agents should use REA?", " \r"),
+        step("Apply these 2 changes?", "\r"),
+      ],
+      false,
+      [
+        {
+          ...actions[0],
+          operation: "update",
+          backupPath: "/isolated/.codex/config.toml.bak",
+          commands: ["npx -y rea-agents@3.2.1 mcp"],
+        },
+        actions[1],
+      ],
+    );
+    expect(result.output).toContain("/isolated/.codex/config.toml.bak");
+    expect(result.output).toContain("command: npx -y rea-agents@3.2.1 mcp");
+    expect(result.output.indexOf("command:")).toBeLessThan(
+      result.output.indexOf("Apply these 2 changes?"),
+    );
+  });
+
+  it("treats final No as cancellation", async () => {
+    const result = await runJourney([
+      step("Which agents should use REA?", " \r"),
+      step("Apply these 2 changes?", "\u001b[D\r"),
+    ]);
+    expect(result.output).toContain("Setup cancelled. No changes were made.");
+    expect(result.decision.cancelled).toBe(true);
+    expect(result.decision.approved).toBe(false);
+  });
+
+  it("restores the terminal after Ctrl-C during selection", async () => {
+    const result = await runJourney([
+      step("Which agents should use REA?", "\u0003"),
+    ]);
+    expect(result.output).toContain("\u001b[?25h");
+    expect(result.decision.cancelled).toBe(true);
+  });
+
+  it("can install the skill for CLI use without an agent registration", async () => {
+    const result = await runJourney([
+      step("Which agents should use REA?", "\r"),
+      step("Install the guided REA skill for CLI use?", "\u001b[D\r"),
+      step("Apply this change?", "\r"),
+    ]);
+    expect(result.decision.selectedActionIds).toEqual(["install_skill"]);
+    expect(result.decision.approved).toBe(true);
+  });
+
+  it("offers Hopper separately and defaults against installing it", async () => {
+    const result = await runJourney(
+      [
+        step("Which agents should use REA?", " \r"),
+        step("Install Hopper for deep binary analysis?", "\r"),
+        step("Apply these 2 changes?", "\r"),
+      ],
+      false,
+      actions,
+    );
+    expect(result.decision.selectedActionIds).toEqual([
+      "configure_client:codex",
+      "install_skill",
+    ]);
+  });
+
+  it("uses sequential prompts without auto-selecting detected agents in accessible mode", async () => {
+    const result = await runJourney(
+      [
+        step("Configure Codex?", "\r"),
+        step("Configure OpenCode?", "\u001b[A\r"),
         step("Apply this change?", "\r"),
       ],
       true,
-      actions.filter(({ kind }) => kind !== "configure_client"),
+      [{ ...actions[0], id: "configure_client:opencode", label: "OpenCode" }],
     );
-
-    expect(result.output).toContain("Ready to review");
-    expect(result.output).toContain("INSTALL  REA reverse-engineering skill");
-    expect(result.decision).toEqual({
-      approved: true,
-      selectedActionIds: ["install_skill"],
-    });
+    expect(result.decision.selectedActionIds).toEqual([
+      "configure_client:opencode",
+    ]);
   });
 
-  it("allows accessible opt-out of the pre-selected agent integration", async () => {
+  it("preselects only a prior REA registration", async () => {
     const result = await runJourney(
       [
-        step("Set up Agent integration (MCP + guided workflow)?", "\u001b[B\r"),
-        step("Set up Hopper deep-analysis provider (provider)?", "\r"),
+        step("Which agents should use REA?", "\r"),
+        step("Apply these 2 changes?", "\r"),
       ],
-      true,
+      false,
+      agentActions,
+      ["codex"],
     );
-
-    expect(result.output).toContain("Nothing selected. No changes were made.");
-    expect(result.decision.selectedActionIds).toEqual([]);
+    expect(result.decision.selectedActionIds).toEqual([
+      "configure_client:codex",
+      "install_skill",
+    ]);
   });
 });
 
 describe("interactive setup completion", () => {
-  it("frames completion around the capabilities that are now ready", async () => {
+  it.each([
+    { npmCommand: "", userAgent: "", launcher: "rea" },
+    {
+      npmCommand: "exec",
+      userAgent: "npm/10.9.0 node/v24.11.0 linux x64",
+      launcher: "npx rea-agents",
+    },
+    {
+      npmCommand: "exec",
+      userAgent: "bun/1.4.2 npm/? node/v26.3.0 linux x64",
+      launcher: "bunx rea-agents",
+    },
+  ])(
+    "prints an available next command for $launcher invocation",
+    async ({ npmCommand, userAgent, launcher }) => {
+      const { stderr } = await execute(
+        process.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          [
+            'import { renderInteractiveSetupResult } from "./dist/cli/interactiveSetup.js";',
+            "renderInteractiveSetupResult({",
+            '  status: "ready",',
+            "  plannedActions: [],",
+            "  appliedActions: [],",
+            '  clients: { codex: { status: "configured" } },',
+            "  doctor: {",
+            "    healthy: true,",
+            '    availableProviders: ["hopper", "ghidra"],',
+            '    hopperPath: "/Applications/Hopper",',
+            "    checks: [],",
+            '    providerInspections: [{ id: "ghidra", available: true }],',
+            '    identity: { skill: { state: "aligned" }, registrations: [{ client: "codex", state: "aligned" }] },',
+            "  },",
+            "});",
+          ].join("\n"),
+        ],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([key]) =>
+                  !["npm_command", "npm_config_user_agent"].includes(
+                    key.toLowerCase(),
+                  ),
+              ),
+            ),
+            npm_command: npmCommand,
+            npm_config_user_agent: userAgent,
+            NO_COLOR: "1",
+          },
+        },
+      );
+
+      expect(stderr).toContain("What you can do now");
+      expect(stderr).toContain("Deep analysis: Hopper and Ghidra");
+      expect(stderr).toContain("Agent access: Codex");
+      expect(stderr).toContain(
+        "Guided reverse-engineering workflows: installed",
+      );
+      expect(stderr).toContain(`CLI: ${launcher} analyze /path/to/app`);
+      expect(stderr).toContain(
+        'Try in Codex: "Explain how a feature works in /path/to/app and show the evidence."',
+      );
+    },
+  );
+
+  it("prints IDA and JADX with their product spellings", async () => {
     const { stderr } = await execute(
       process.execPath,
       [
         "--input-type=module",
         "--eval",
         [
-          'import { renderInteractiveSetupResult } from "./dist/cliSetup.js";',
+          'import { renderInteractiveSetupResult } from "./dist/cli/interactiveSetup.js";',
           "renderInteractiveSetupResult({",
           '  status: "ready",',
           "  plannedActions: [],",
           "  appliedActions: [],",
-          '  clients: { codex: { status: "configured" } },',
+          "  clients: {},",
           "  doctor: {",
           "    healthy: true,",
-          '    hopperPath: "/Applications/Hopper",',
+          '    availableProviders: ["hopper", "ghidra", "ida", "jadx", "kuna"],',
           "    checks: [],",
-          '    providerInspections: [{ id: "ghidra", available: true }],',
-          '    identity: { skill: { state: "aligned" }, registrations: [{ client: "codex", state: "aligned" }] },',
           "  },",
-          "});",
+          "}, {});",
         ].join("\n"),
       ],
-      {
-        cwd: process.cwd(),
-        env: { ...process.env, NO_COLOR: "1" },
-      },
+      { cwd: process.cwd(), env: { ...process.env, NO_COLOR: "1" } },
     );
 
-    expect(stderr).toContain("What you can do now");
-    expect(stderr).toContain("Deep analysis: Hopper and Ghidra");
-    expect(stderr).toContain("Agent access: Codex");
-    expect(stderr).toContain("Guided reverse-engineering workflows: installed");
-    expect(stderr).toContain("CLI: rea analyze /path/to/app");
     expect(stderr).toContain(
-      'Try in Codex: "Explain how a feature works in /path/to/app and show the evidence."',
+      "Deep analysis: Hopper, Ghidra, IDA, JADX, and Kuna",
     );
+    expect(stderr).not.toContain("Ida");
+    expect(stderr).not.toContain("Jadx");
+  });
+
+  it("prints retained cleanup resources without relying on paths in remediation", async () => {
+    const resources = ["/fixture/owned backup", "/fixture/临时目录"];
+    const result: SetupResult = {
+      status: "needs_human",
+      code: "cleanup_failed",
+      plannedActions: [],
+      appliedActions: [],
+      clients: {},
+      clientStates: [],
+      doctor: {
+        healthy: true,
+        environment_healthy: true,
+        availableProviders: [],
+        scope: {
+          mode: "explicit",
+          clients: [],
+          providers: [],
+          skill: false,
+          target: null,
+        },
+      },
+      remediation: "Owned descriptor remains busy",
+      cleanup: { reason: "Owned descriptor remains busy", resources },
+    };
+    const { stderr } = await execute(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        'import { renderInteractiveSetupResult } from "./dist/cli/interactiveSetup.js";\n' +
+          `renderInteractiveSetupResult(${JSON.stringify(result)}, {});`,
+      ],
+      { cwd: process.cwd(), env: { ...process.env, NO_COLOR: "1" } },
+    );
+    expect(stderr).toContain(result.remediation);
+    for (const resource of resources) expect(stderr).toContain(resource);
   });
 });
 
@@ -277,10 +804,7 @@ interface JourneyStep {
 
 interface JourneyResult {
   readonly output: string;
-  readonly decision: {
-    readonly approved: boolean;
-    readonly selectedActionIds: readonly string[];
-  };
+  readonly decision: z.infer<typeof decisionSchema>;
 }
 
 const step = (prompt: string, input: string): JourneyStep => ({
@@ -291,13 +815,19 @@ const step = (prompt: string, input: string): JourneyStep => ({
 const runJourney = async (
   steps: readonly JourneyStep[],
   accessible = false,
-  journeyActions: readonly object[] = actions,
+  journeyActions: readonly object[] = agentActions,
+  initialClientIds: readonly string[] = [],
 ): Promise<JourneyResult> => {
   const isolatedHome = await createTestTempDirectory("rea-cli-setup-test-");
   const script = [
-    'import { confirmInteractiveSetup } from "./dist/cliSetup.js";',
+    'import { confirmInteractiveSetup } from "./dist/cli/interactiveSetup.js";',
     `const actions = ${JSON.stringify(journeyActions)};`,
-    `const decision = await confirmInteractiveSetup(actions, ${JSON.stringify(accessible)});`,
+    `const context = ${JSON.stringify({ stage: "select", clientStates, selectedClientIds: initialClientIds, clientSelectionAllowed: true })};`,
+    `let decision = await confirmInteractiveSetup(actions, ${JSON.stringify(accessible)}, context);`,
+    "if (!decision.cancelled && decision.selectedActionIds.length > 0) {",
+    "  const selected = new Set(decision.selectedActionIds);",
+    `  decision = await confirmInteractiveSetup(actions.filter(({ id }) => selected.has(id)), ${JSON.stringify(accessible)}, { ...context, stage: "confirm", clientSelectionAllowed: false });`,
+    "}",
     `process.stdout.write(${JSON.stringify(`\n${decisionMarker}`)} + JSON.stringify(decision) + "\\n");`,
   ].join("\n");
 
@@ -313,6 +843,7 @@ const runJourney = async (
         env: {
           ...process.env,
           HOME: isolatedHome,
+          USERPROFILE: isolatedHome,
           NO_COLOR: "1",
           TERM: "xterm-256color",
         },
@@ -350,9 +881,13 @@ const runJourney = async (
         finish(new Error(`Setup journey returned no decision:\n${output}`));
         return;
       }
-      const serialized = output
-        .slice(markerIndex + decisionMarker.length)
-        .split(/\r?\n/u, 1)[0];
+      const raw = output.slice(markerIndex + decisionMarker.length);
+      const jsonStart = raw.indexOf("{");
+      const jsonEnd = raw.lastIndexOf("}");
+      const serialized =
+        jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart
+          ? raw.slice(jsonStart, jsonEnd + 1)
+          : raw.split(/\r?\n/u, 1)[0];
       if (serialized === undefined) {
         finish(
           new Error(`Setup journey returned an empty decision:\n${output}`),
@@ -362,7 +897,7 @@ const runJourney = async (
       try {
         finish(undefined, {
           output,
-          decision: JSON.parse(serialized) as JourneyResult["decision"],
+          decision: decisionSchema.parse(JSON.parse(serialized)),
         });
       } catch (cause: unknown) {
         finish(cause instanceof Error ? cause : new Error(String(cause)));

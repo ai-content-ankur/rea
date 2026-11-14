@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
-import { access, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { access } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { CdpBrowserProvider } from "../dist/browser/CdpBrowserProvider.js";
-import { waitForBrowserDevtoolsPort } from "../dist/browser/BrowserProcessStartup.js";
-import { PlaywrightBrowserScenarioProvider } from "../dist/browser/PlaywrightBrowserScenarioProvider.js";
+import { startRuntimeFixtureBrowser } from "./lib/browser-runtime-fixture-lifecycle.mjs";
+
+import { createBrowserScenarioProvider } from "../dist/composition/browserScenario.js";
 import {
   inspectWebPageInputSchema,
   listBrowserTargetsInputSchema,
 } from "../dist/domain/browserObservation.js";
-import { analyzeWebBundleInputSchema } from "../dist/domain/webBundleAnalysis.js";
 import { observeWebSessionInputSchema } from "../dist/domain/browserSession.js";
-import { compareWebCapturesInputSchema } from "../dist/domain/webCaptureDiff.js";
+import { compareWebCapturesInputSchema } from "../dist/domain/webCaptureDiffSchemas.js";
 import {
   captureWebScreenshotInputSchema,
   compareWebScreenshotsInputSchema,
@@ -31,61 +31,48 @@ import {
   browserScenario,
   runScenarioCli,
   scenarioProfiles,
+  verifyScenarioFailureEvidence,
 } from "./lib/browser-scenario-verifier.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { withVerifierCleanup } from "./lib/verifier-cleanup.mjs";
+import { requireOrdinaryWindowsVerifierCaller } from "./lib/windows-ordinary-user-verifier.mjs";
 import { verifyLargeScreenshotE2e } from "./lib/browser-screenshot-e2e.mjs";
+import { verifyViewportScreenshotE2e } from "./lib/browser-viewport-screenshot-e2e.mjs";
+import { verifyPopupEventCoverage } from "./lib/browser-popup-e2e.mjs";
+import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
+import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
+import { verifyBrowserModules } from "./lib/browser-module-e2e.mjs";
+import { verifyBrowserDomDestinations } from "./lib/browser-dom-destinations-e2e.mjs";
+import { verifyBrowserSocketTransport } from "./lib/browser-socket-e2e.mjs";
+import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metadata-budget-e2e.mjs";
+import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
+import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
+import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
+import { verifyScenarioStorageFingerprints } from "./lib/browser-scenario-storage-fingerprints-e2e.mjs";
+import { verifyScenarioServiceWorkers } from "./lib/browser-scenario-service-workers-e2e.mjs";
+import { verifyBrowserUrlUserInfo } from "./lib/browser-url-userinfo-e2e.mjs";
 
-const SECRET_VALUES = [
-  "network-secret-value",
-  "console-secret-value",
-  "storage-secret-value",
-  "websocket-secret-value",
-  "ax-private-label-value",
-];
-const REAL_BROWSER_STARTUP_TIMEOUT_MS = 30_000;
+const SCENARIO_SECRET_VALUE = "rea-browser-verifier-secret";
+const SCENARIO_URL_SECRET_VALUE = "rea-browser-url-verifier-secret";
+process.env.REA_BROWSER_VERIFIER_SECRET = SCENARIO_SECRET_VALUE;
+process.env.REA_BROWSER_VERIFIER_URL = SCENARIO_URL_SECRET_VALUE;
 const verifierRun = createVerifierRun();
 
+await requireOrdinaryWindowsVerifierCaller();
 const executable = await browserExecutable();
-const profile = await mkdtemp(join(tmpdir(), "rea-real-browser-"));
-const site = await startBrowserVerifierSite();
+let site;
 let browser;
 let pageProxy;
-try {
-  browser = spawn(
+let report;
+await withVerifierCleanup(async () => {
+  site = await startBrowserVerifierSite();
+  browser = await startRuntimeFixtureBrowser(
     executable,
-    [
-      "--headless=new",
-      ...(process.env.REA_BROWSER_NO_SANDBOX === "true"
-        ? ["--no-sandbox"]
-        : []),
-      "--remote-debugging-address=127.0.0.1",
-      "--remote-debugging-port=0",
-      `--user-data-dir=${profile}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-dev-shm-usage",
-      "--disable-sync",
-      "--metrics-recording-only",
-      `${site.origin}/app?startup=browser-secret-value`,
-    ],
-    { stdio: ["ignore", "ignore", "pipe"] },
+    `${site.origin}/app?startup=browser-secret-value`,
   );
-  let stderr = "";
-  browser.stderr.on("data", (chunk) => {
-    if (stderr.length < 64 * 1_024) stderr += chunk.toString("utf8");
-  });
-  const port = await waitForBrowserDevtoolsPort({
-    child: browser,
-    executable,
-    activePortPath: join(profile, "DevToolsActivePort"),
-    stderr: () => stderr,
-    timeoutMs: REAL_BROWSER_STARTUP_TIMEOUT_MS,
-  });
-  const endpoint = `http://127.0.0.1:${String(port)}`;
+  const endpoint = `http://127.0.0.1:${String(browser.port)}`;
   const provider = new CdpBrowserProvider();
-  const target = await pageTarget(provider, endpoint, site.origin);
+  const target = await pageTarget(provider, endpoint);
   const observed = await provider.inspectPage(
     inspectWebPageInputSchema.parse({
       cdp_endpoint: endpoint,
@@ -98,26 +85,44 @@ try {
   );
   if (!observed.ok) throw observed.error;
   assertObservation(observed.value, site.origin);
+  const domDestinations = await verifyBrowserDomDestinations({
+    cdp_endpoint: endpoint,
+    target_id: target,
+  });
   const serialized = JSON.stringify(observed.value);
-  for (const secret of [...SECRET_VALUES, "browser-secret-value"])
+  if (
+    !observed.value.target.url.includes("startup=browser-secret-value") ||
+    !observed.value.network.requests.some((request) =>
+      request.url.includes("token=network-secret-value"),
+    )
+  )
+    throw new Error(
+      "Passive browser result did not preserve ordinary URL queries",
+    );
+  for (const secret of [
+    "request-secret-value",
+    "request-body-secret-value",
+    "response-secret-value",
+    "storage-secret-value",
+    "websocket-secret-value",
+  ])
     if (serialized.includes(secret))
       throw new Error(
-        `Passive browser result retained redacted value: ${secret}`,
+        `Passive browser result included unselected structured data: ${secret}`,
       );
 
-  const withSource = await provider.inspectPage(
-    inspectWebPageInputSchema.parse({
-      cdp_endpoint: endpoint,
-      allowed_origins: [site.origin],
-      target_id: target,
-      observation_ms: 1_000,
-      include_accessibility_text: true,
-      include_script_sources: true,
-      include_console_text: true,
-      include_json_body_shapes: true,
-      include_websocket_shapes: true,
-    }),
-  );
+  const sourceCaptureInput = inspectWebPageInputSchema.parse({
+    cdp_endpoint: endpoint,
+    allowed_origins: [site.origin],
+    target_id: target,
+    observation_ms: 1_000,
+    include_accessibility_text: true,
+    include_script_sources: true,
+    include_console_text: true,
+    include_json_body_shapes: true,
+    include_websocket_shapes: true,
+  });
+  const withSource = await provider.inspectPage(sourceCaptureInput);
   if (!withSource.ok) throw withSource.error;
   const source = withSource.value.scripts.items.find(
     (script) =>
@@ -138,22 +143,16 @@ try {
     );
   assertSensitiveShapes(withSource.value);
 
-  const bundle = await provider.analyzeBundle(
-    analyzeWebBundleInputSchema.parse({
-      cdp_endpoint: endpoint,
-      allowed_origins: [site.origin],
-      target_id: target,
-      observation_ms: 200,
-      fetch_source_maps: true,
-    }),
-  );
-  if (!bundle.ok) throw bundle.error;
-  assertBundleAnalysis(bundle.value);
+  const bundle = await verifyPublicBundle(endpoint, target, site.origin);
 
+  // Equality needs the same selected facts on both sides. The earlier passive
+  // capture deliberately omits source, so it cannot establish source equality.
+  const repeatedSource = await provider.inspectPage(sourceCaptureInput);
+  if (!repeatedSource.ok) throw repeatedSource.error;
   const captureDiff = await provider.compareCaptures(
     compareWebCapturesInputSchema.parse({
-      before: { inspection: observed.value },
-      after: { inspection: withSource.value },
+      before: { inspection: withSource.value },
+      after: { inspection: repeatedSource.value },
     }),
   );
   if (!captureDiff.ok) throw captureDiff.error;
@@ -161,7 +160,16 @@ try {
     captureDiff.value.dimensions.dom_structure.status !== "unchanged" ||
     captureDiff.value.dimensions.scripts.status !== "unchanged"
   )
-    throw new Error("Real Chrome stable capture identities did not reconcile");
+    throw new Error(
+      `Real Chrome stable capture identities did not reconcile: ${JSON.stringify(
+        {
+          dom_structure: captureDiff.value.dimensions.dom_structure,
+          scripts: captureDiff.value.dimensions.scripts,
+          before_completeness: withSource.value.completeness,
+          after_completeness: repeatedSource.value.completeness,
+        },
+      )}`,
+    );
 
   const screenshot = await provider.captureScreenshot(
     captureWebScreenshotInputSchema.parse({
@@ -212,39 +220,36 @@ try {
 
   pageProxy = await startPageCdpProxy(endpoint);
   await verifyPageScopedTransport(provider, pageProxy, site.origin);
+  const browserSocketTransport = await verifyBrowserSocketTransport({
+    provider,
+    profile: browser.profile,
+    endpoint,
+    target,
+    origin: site.origin,
+  });
   const attachedScenarioInput = browserScenario(
     {
       mode: "connect",
       cdp_endpoint: endpoint,
       target_id: target,
-      ownership: "external",
-      cleanup: "disconnect-only",
     },
     site.origin,
   );
   let attachedScenario;
   try {
-    attachedScenario = await runScenarioCli(attachedScenarioInput, {
-      REA_BROWSER_SCENARIO_CDP_ENDPOINTS_JSON: JSON.stringify([endpoint]),
-      REA_BROWSER_SCENARIO_ALLOWED_ORIGINS_JSON: JSON.stringify([site.origin]),
-    });
+    attachedScenario = await runScenarioCli(attachedScenarioInput);
   } catch (cliError) {
-    const direct =
-      await new PlaywrightBrowserScenarioProvider().captureScenario(
-        attachedScenarioInput,
-      );
+    const direct = await createBrowserScenarioProvider(
+      process.env,
+    ).captureScenario(attachedScenarioInput);
     if (!direct.ok) {
       const underlying = direct.error.cause;
       const details =
         underlying instanceof Error
           ? `${underlying.name}: ${underlying.message}`
           : String(underlying ?? direct.error.message);
-      const redactedDetails = [...SECRET_VALUES, "browser-secret-value"].reduce(
-        (message, secret) => message.replaceAll(secret, "<redacted>"),
-        details,
-      );
       throw new Error(
-        `Attached browser scenario failed through both CLI and provider: ${redactedDetails}`,
+        `Attached browser scenario failed through both CLI and provider: ${details}`,
         { cause: cliError },
       );
     }
@@ -263,23 +268,43 @@ try {
       "Scenario CLI did not report external disconnect ownership",
     );
   const versionResponse = await fetch(`${endpoint}/json/version`);
-  if (!versionResponse.ok || browser.exitCode !== null)
+  if (!versionResponse.ok || browser.process.exitCode !== null)
     throw new Error("Scenario attachment terminated its external browser");
 
   const profilesBefore = await scenarioProfiles();
-  const launchedScenario =
-    await new PlaywrightBrowserScenarioProvider().captureScenario(
-      browserScenario(
-        {
-          mode: "launch",
-          executable_path: executable,
-          headless: true,
-          user_data: "temporary-owned",
-          cleanup: "close-and-delete-profile",
-        },
-        site.origin,
-      ),
-    );
+  process.stderr.write("Browser verifier: scenario environment\n");
+  const scenarioEnvironment = await verifyScenarioEnvironment(
+    endpoint,
+    target,
+    site.origin,
+  );
+  process.stderr.write("Browser verifier: scenario storage\n");
+  const scenarioStorage = await verifyScenarioStorage({
+    executable,
+    endpoint,
+    targetId: target,
+  });
+  process.stderr.write("Browser verifier: scenario storage fingerprints\n");
+  const scenarioStorageFingerprints = await verifyScenarioStorageFingerprints(
+    executable,
+    site.origin,
+  );
+  process.stderr.write("Browser verifier: scenario service workers\n");
+  const scenarioServiceWorkers = await verifyScenarioServiceWorkers(
+    endpoint,
+    target,
+  );
+  const launchedScenario = await createBrowserScenarioProvider(
+    process.env,
+  ).captureScenario(
+    browserScenario(
+      {
+        mode: "launch",
+        executable_path: executable,
+      },
+      site.origin,
+    ),
+  );
   if (!launchedScenario.ok) throw launchedScenario.error;
   if (
     launchedScenario.value.browser.cleanup !== "terminated-owned-process" ||
@@ -290,53 +315,164 @@ try {
   if ([...profilesAfter].some((entry) => !profilesBefore.has(entry)))
     throw new Error("Scenario launch retained a temporary browser profile");
   assertScenarioCapture(launchedScenario.value);
-  for (const secret of ["network-secret-value", "websocket-url-secret"])
-    if (
-      JSON.stringify([attachedScenario, launchedScenario.value]).includes(
-        secret,
-      )
-    )
-      throw new Error(`Browser scenario retained sensitive value: ${secret}`);
-
-  const largeScreenshot = await verifyLargeScreenshotE2e(endpoint, site.origin);
-  process.stdout.write(
-    `${JSON.stringify({
-      verifier_run: await completeVerifierRun(verifierRun),
-      browser: observed.value.browser.product,
-      endpoint,
-      target,
-      domNodes: observed.value.dom.nodes.length,
-      accessibilityNodes: observed.value.accessibility.nodes.length,
-      scripts: observed.value.scripts.items.length,
-      networkRequests: observed.value.network.requests.length,
-      consoleEvents: observed.value.console.events.length,
-      websocketEvents: observed.value.network.websocket_events.length,
-      bundleScripts: bundle.value.capture.scripts_analyzed,
-      sourceMaps: bundle.value.observations.source_maps.processed,
-      sessionEvents: session.value.timeline.length,
-      pageScopedTransport: true,
-      screenshotBytes: screenshot.value.artifact.bytes,
-      largeScreenshot,
-      browserScenarioCli: true,
-      browserScenarioAttachCleanup: "disconnected-external",
-      browserScenarioLaunchCleanup: "terminated-owned-process",
-      verified: true,
-    })}\n`,
+  const scenarioFailure = await verifyScenarioFailureEvidence(
+    executable,
+    site.origin,
   );
-} finally {
-  if (pageProxy !== undefined) await pageProxy.close();
-  if (browser !== undefined) await stopProcess(browser);
-  await site.close();
-  await rm(profile, {
-    recursive: true,
-    force: true,
-    maxRetries: 10,
-    retryDelay: 100,
+  const scenarioResults = JSON.stringify([
+    attachedScenario,
+    launchedScenario.value,
+  ]);
+  for (const retainedValue of [
+    "token=network-secret-value",
+    "token=websocket-url-secret",
+    "authorization=Bearer console-secret-value",
+    "websocket-secret-value",
+  ])
+    if (!scenarioResults.includes(retainedValue))
+      throw new Error(
+        `Browser scenario did not preserve selected value: ${retainedValue}`,
+      );
+  for (const unselectedValue of [
+    SCENARIO_SECRET_VALUE,
+    SCENARIO_URL_SECRET_VALUE,
+    "request-secret-value",
+    "request-body-secret-value",
+    "response-secret-value",
+    "storage-secret-value",
+  ])
+    if (scenarioResults.includes(unselectedValue))
+      throw new Error(
+        `Browser scenario included unselected structured value: ${unselectedValue}`,
+      );
+
+  process.stderr.write("Browser verifier: large screenshot\n");
+  const largeScreenshot = await verifyLargeScreenshotE2e(endpoint, site.origin);
+  process.stderr.write("Browser verifier: visual viewport screenshot\n");
+  const viewportScreenshot = await verifyViewportScreenshotE2e(
+    endpoint,
+    site.origin,
+  );
+  process.stderr.write("Browser verifier: popup coverage\n");
+  const popupEvents = await verifyPopupEventCoverage(executable);
+  const networkEvidence = await verifyBrowserNetworkEvidence(
+    executable,
+    undefined,
+    { cdp_endpoint: endpoint, target_id: target },
+  );
+  const scriptExport = await verifyBrowserScriptExport(executable, undefined, {
+    cdp_endpoint: endpoint,
+    target_id: target,
   });
+  const moduleTrace = await verifyBrowserModules(executable);
+  const captureMetadata = await verifyBrowserCaptureMetadataBudget(endpoint);
+  const urlUserInfo = await verifyBrowserUrlUserInfo(endpoint, site.origin);
+  report = {
+    browser: observed.value.browser.product,
+    endpoint,
+    target,
+    domNodes: observed.value.dom.nodes.length,
+    accessibilityNodes: observed.value.accessibility.nodes.length,
+    scripts: observed.value.scripts.items.length,
+    networkRequests: observed.value.network.requests.length,
+    consoleEvents: observed.value.console.events.length,
+    websocketConnections: observed.value.network.websocket_connections.length,
+    websocketFrames: observed.value.network.websocket_connections.reduce(
+      (total, connection) => total + connection.events.length,
+      0,
+    ),
+    bundleScripts: bundle.capture.scripts_analyzed,
+    sourceMaps: bundle.observations.source_maps.processed,
+    bundle_cli_and_stdio_mcp: true,
+    sessionEvents: session.value.timeline.length,
+    pageScopedTransport: true,
+    browserSocketTransport,
+    screenshotBytes: screenshot.value.artifact.bytes,
+    largeScreenshot,
+    popupEvents,
+    networkEvidence,
+    scriptExport,
+    moduleTrace,
+    captureMetadata,
+    urlUserInfo,
+    domDestinations,
+    browserScenarioCli: true,
+    browserScenarioAttachCleanup: "disconnected-external",
+    browserScenarioLaunchCleanup: "terminated-owned-process",
+    scenarioFailure,
+    scenarioEnvironment,
+    scenarioStorage,
+    scenarioStorageFingerprints,
+    scenarioServiceWorkers,
+    viewportScreenshot,
+    verified: true,
+  };
+}, [
+  async () => {
+    if (pageProxy !== undefined) {
+      process.stderr.write("Browser verifier cleanup: closing page proxy\n");
+      await pageProxy.close();
+    }
+  },
+  async () => {
+    if (browser !== undefined) {
+      process.stderr.write("Browser verifier cleanup: stopping owned Chrome\n");
+      await browser.close();
+    }
+  },
+  async () => {
+    if (site !== undefined) {
+      process.stderr.write("Browser verifier cleanup: closing fixture site\n");
+      await site.close();
+    }
+  },
+]);
+process.stdout.write(
+  `${JSON.stringify({
+    verifier_run: await completeVerifierRun(verifierRun),
+    ...report,
+  })}\n`,
+);
+
+async function verifyPublicBundle(endpoint, target, origin) {
+  const evidence = await artifactCliEvidence("analyze-web-bundle", endpoint, [
+    target,
+    "--allowed-origins",
+    origin,
+    "--fetch-source-maps",
+    "--observation-ms",
+    "200",
+  ]);
+  assertBundleAnalysis(evidence.normalized_result);
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [fileURLToPath(new URL("./rea.mjs", import.meta.url)), "mcp"],
+    env: { PATH: process.env.PATH ?? "", REA_LOG_LEVEL: "silent" },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "browser-bundle-e2e", version: "1" });
+  try {
+    await client.connect(transport);
+    const result = await artifactMcpResult(client, "analyze_web_bundle", {
+      cdp_endpoint: endpoint,
+      target_id: target,
+      allowed_origins: [origin],
+      fetch_source_maps: true,
+      observation_ms: 200,
+    });
+    assertBundleAnalysis(result);
+  } finally {
+    try {
+      await client.close();
+    } finally {
+      await transport.close();
+    }
+  }
+  return evidence.normalized_result;
 }
 
 async function verifyPageScopedTransport(provider, proxy, origin) {
-  const target = await pageTarget(provider, proxy.endpoint, origin);
+  const target = await pageTarget(provider, proxy.endpoint);
   const input = inspectWebPageInputSchema.parse({
     cdp_endpoint: proxy.endpoint,
     allowed_origins: [origin],
@@ -372,20 +508,34 @@ async function verifyPageScopedTransport(provider, proxy, origin) {
       target_id: target,
       observation_ms: 5_000,
     }),
+    {
+      progress: {
+        report(event) {
+          if (event.phase === "browser_observation" && event.completed === 1)
+            proxy.disconnectClients();
+          return Promise.resolve();
+        },
+      },
+    },
   );
-  await delay(100);
-  proxy.disconnectClients();
   const disconnected = await disconnectedPromise;
   if (
     !disconnected.ok ||
-    disconnected.value.window.end_reason !== "target_terminated" ||
+    disconnected.value.window.end_reason !== "transport_disconnected" ||
     !disconnected.value.timeline.some(
-      ({ type }) => type === "target_terminated",
-    )
+      ({ type }) => type === "transport_disconnected",
+    ) ||
+    disconnected.value.timeline.some(({ type }) => type === "target_terminated")
   )
     throw new Error(
-      "Page-scoped CDP disconnect was not reported as target_terminated",
+      "Page-scoped CDP disconnect must report transport loss without claiming a target crash",
     );
+  const remaining = await provider.listTargets(
+    listBrowserTargetsInputSchema.parse({ cdp_endpoint: proxy.endpoint }),
+  );
+  if (!remaining.ok) throw remaining.error;
+  if (!remaining.value.targets.some(({ target_id }) => target_id === target))
+    throw new Error("Page-scoped CDP disconnect removed its live target");
 }
 
 async function browserExecutable() {
@@ -413,12 +563,11 @@ async function browserExecutable() {
   );
 }
 
-async function pageTarget(provider, endpoint, origin) {
+async function pageTarget(provider, endpoint) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const listed = await provider.listTargets(
       listBrowserTargetsInputSchema.parse({
         cdp_endpoint: endpoint,
-        allowed_origins: [origin],
       }),
     );
     if (listed.ok && listed.value.targets[0] !== undefined)
@@ -430,24 +579,4 @@ async function pageTarget(provider, endpoint, origin) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function stopProcess(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const gracefulExit = waitForExit(child);
-  child.kill("SIGTERM");
-  const exited = await Promise.race([
-    gracefulExit.then(() => true),
-    delay(2_000).then(() => false),
-  ]);
-  if (!exited) {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const forcedExit = waitForExit(child);
-    child.kill("SIGKILL");
-    await forcedExit;
-  }
-}
-
-function waitForExit(child) {
-  return new Promise((resolve) => child.once("exit", resolve));
 }

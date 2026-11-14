@@ -1,17 +1,15 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
-import {
-  inspectWebPageInputSchema,
-  webPageInspectionSchema,
-} from "../../../src/domain/browserObservation.js";
+import { inspectWebPageInputSchema } from "../../../src/domain/browserObservation.js";
+import { webPageInspectionSchema } from "../../../src/domain/browserObservationSchemas.js";
 import {
   startFakeCdpBrowser,
   type FakeCdpBrowser,
 } from "../../fixtures/fakeCdpBrowser.js";
-import { describeBrowser, trackBrowser } from "./cdpBrowserProvider.support.js";
+import { trackBrowser } from "./cdpBrowserProvider.support.js";
 
-describeBrowser("CdpBrowserProvider: sensitive data 1", () => {
+describe("CdpBrowserProvider: passive evidence redaction", () => {
   it("captures bounded passive evidence without retaining sensitive values", async () => {
     const browser = await startFakeCdpBrowser({
       binaryWebSocketEvent: true,
@@ -53,7 +51,7 @@ describeBrowser("CdpBrowserProvider: sensitive data 1", () => {
     );
     expect(result.value.scripts.items[0]?.frame_id).toBe("frame-main");
     expect(result.value.scripts.items[0]?.source_map_url).toBe(
-      `${browser.allowedOrigin}/app.js.map?token=%5BREDACTED%5D`,
+      `${browser.allowedOrigin}/app.js.map?token=map-secret`,
     );
     expect(result.value.scripts.items[0]?.resource_reconciliation).toEqual({
       status: "exact",
@@ -61,30 +59,34 @@ describeBrowser("CdpBrowserProvider: sensitive data 1", () => {
     });
     expect(result.value.scripts.items[0]?.source).toEqual({
       included: false,
-      reason: "source capture was not approved",
+      reason: "source capture was not selected",
     });
     expect(result.value.resources).toHaveLength(1);
     expect(result.value.network.requests).toHaveLength(1);
     expect(result.value.network.requests[0]?.initiator).toEqual({
       type: "script",
-      url: `${browser.allowedOrigin}/app.js?caller=%5BREDACTED%5D`,
+      url: `${browser.allowedOrigin}/app.js?caller=caller-secret`,
       line: 3,
       column: 5,
     });
-    expect(result.value.network.websocket_events).toEqual([
+    expect(result.value.network.websocket_connections).toEqual([
       {
         request_id: "websocket-1",
-        direction: "sent",
-        opcode: 1,
-        payload_bytes: Buffer.byteLength("websocket-secret"),
-        payload_shape: null,
-      },
-      {
-        request_id: "websocket-1",
-        direction: "received",
-        opcode: 2,
-        payload_bytes: 3,
-        payload_shape: null,
+        url: `ws://${new URL(browser.allowedOrigin).host}/live?token=websocket-url-secret`,
+        events: [
+          {
+            direction: "sent",
+            opcode: 1,
+            payload_bytes: Buffer.byteLength("websocket-secret"),
+            payload_shape: null,
+          },
+          {
+            direction: "received",
+            opcode: 2,
+            payload_bytes: 3,
+            payload_shape: null,
+          },
+        ],
       },
     ]);
     expect(result.value.console.events[0]?.argument_types).toEqual(["string"]);
@@ -110,7 +112,7 @@ describeBrowser("CdpBrowserProvider: sensitive data 1", () => {
       dom_urls: [
         {
           attribute: "href",
-          url: `${browser.allowedOrigin}/agent?token=%5BREDACTED%5D`,
+          url: `${browser.allowedOrigin}/agent?token=dom-url-secret`,
           destination_scope: "approved",
         },
       ],
@@ -158,7 +160,39 @@ describeBrowser("CdpBrowserProvider: sensitive data 1", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: complete storage fingerprints", () => {
+describe("CdpBrowserProvider: page cookie scope", () => {
+  it("uses the attached page URL for cookies and its origin for DOM storage", async () => {
+    const browser = await startFakeCdpBrowser();
+    trackBrowser(browser);
+    const result = await new CdpBrowserProvider().inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        allowed_origins: [browser.allowedOrigin],
+        target_id: "allowed-page",
+        observation_ms: 0,
+        include_storage_keys: true,
+        include_storage_fingerprints: true,
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(
+      browser.commands.find(({ method }) => method === "Network.getCookies")
+        ?.params,
+    ).toEqual({ urls: [`${browser.allowedOrigin}/app?token=frame-secret`] });
+    expect(
+      browser.commands.find(
+        ({ method }) => method === "DOMStorage.getDOMStorageItems",
+      )?.params,
+    ).toEqual({
+      storageId: {
+        securityOrigin: browser.allowedOrigin,
+        isLocalStorage: true,
+      },
+    });
+  });
+});
+
+describe("CdpBrowserProvider: complete storage fingerprints", () => {
   it("fingerprints cache bodies above the former byte ceiling", async () => {
     const body = "x".repeat(64 * 1_024 + 1);
     const browser = await startFakeCdpBrowser({ cachedResponseBody: body });
@@ -185,11 +219,13 @@ describeBrowser("CdpBrowserProvider: complete storage fingerprints", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: sensitive data 2", () => {
-  it("captures only approved redacted console text and value-free payload shapes", async () => {
+describe("CdpBrowserProvider: explicitly requested text and payload shapes", () => {
+  it("captures requested console text verbatim and value-free payload shapes", async () => {
     const browser = await startFakeCdpBrowser({
       sensitiveShapes: true,
       binaryWebSocketEvent: true,
+      nullConsoleArgument: true,
+      eventsBeforeReply: ["Network.enable"],
     });
     trackBrowser(browser);
     const result = await new CdpBrowserProvider().inspectPage(
@@ -205,22 +241,42 @@ describeBrowser("CdpBrowserProvider: sensitive data 2", () => {
     );
 
     if (!result.ok) throw result.error;
+    expect(result.value.console.events[0]?.argument_types).toEqual([
+      "string",
+      "number",
+      "object",
+      "object",
+    ]);
     expect(result.value.console.events[0]?.text_capture).toEqual({
       status: "included",
       values: [
-        { argument_index: 0, type: "string", text: "authorization=[REDACTED]" },
+        {
+          argument_index: 0,
+          type: "string",
+          text: "authorization=Bearer console-secret",
+        },
         { argument_index: 1, type: "number", text: "42" },
+        { argument_index: 3, type: "object", text: "null" },
       ],
-      retained_bytes: 26,
+      retained_bytes:
+        Buffer.byteLength("authorization=Bearer console-secret") +
+        Buffer.byteLength("42") +
+        Buffer.byteLength("null"),
     });
     expect(result.value.network.requests[0]?.body_shapes).toMatchObject({
       status: "included",
       request: {
         root_type: "object",
         properties: expect.arrayContaining([
-          expect.objectContaining({ path: "/token", types: ["string"] }),
           expect.objectContaining({
-            path: "/filters/active",
+            path: [{ kind: "property", name: "token" }],
+            types: ["string"],
+          }),
+          expect.objectContaining({
+            path: [
+              { kind: "property", name: "filters" },
+              { kind: "property", name: "active" },
+            ],
             types: ["boolean"],
           }),
         ]),
@@ -229,31 +285,48 @@ describeBrowser("CdpBrowserProvider: sensitive data 2", () => {
         root_type: "object",
         properties: expect.arrayContaining([
           expect.objectContaining({
-            path: "/result/token",
+            path: [
+              { kind: "property", name: "result" },
+              { kind: "property", name: "token" },
+            ],
             types: ["string"],
           }),
-          expect.objectContaining({ path: "/items/*/id", types: ["number"] }),
+          expect.objectContaining({
+            path: [
+              { kind: "property", name: "items" },
+              { kind: "array-element" },
+              { kind: "property", name: "id" },
+            ],
+            types: ["number"],
+          }),
         ]),
       },
     });
-    expect(result.value.network.websocket_events).toEqual([
+    expect(result.value.network.websocket_connections).toEqual([
       expect.objectContaining({
-        opcode: 1,
-        payload_shape: expect.objectContaining({
-          format: "json",
-          json_shape: expect.objectContaining({
-            properties: expect.arrayContaining([
-              expect.objectContaining({ path: "/token", types: ["string"] }),
-            ]),
+        events: [
+          expect.objectContaining({
+            opcode: 1,
+            payload_shape: expect.objectContaining({
+              format: "json",
+              json_shape: expect.objectContaining({
+                properties: expect.arrayContaining([
+                  expect.objectContaining({
+                    path: [{ kind: "property", name: "token" }],
+                    types: ["string"],
+                  }),
+                ]),
+              }),
+            }),
           }),
-        }),
-      }),
-      expect.objectContaining({
-        opcode: 2,
-        payload_shape: {
-          format: "binary",
-          json_shape: null,
-        },
+          expect.objectContaining({
+            opcode: 2,
+            payload_shape: {
+              format: "binary",
+              json_shape: null,
+            },
+          }),
+        ],
       }),
     ]);
     const serialized = JSON.stringify(result.value);
@@ -261,7 +334,6 @@ describeBrowser("CdpBrowserProvider: sensitive data 2", () => {
       "request-body-secret",
       "response-body-secret",
       "websocket-secret",
-      "console-secret",
       "object-secret",
     ])
       expect(serialized).not.toContain(secret);
@@ -272,39 +344,30 @@ describeBrowser("CdpBrowserProvider: sensitive data 2", () => {
   });
 });
 
-describeBrowser("CdpBrowserProvider: complete sensitive data", () => {
-  it("returns complete approved text and shapes while redacting secrets", async () => {
-    const browser = await startFakeCdpBrowser({ sensitiveShapes: true });
+describe("CdpBrowserProvider: WebSocket connection projection", () => {
+  it("retains allowed connections created without observed frames", async () => {
+    const browser = await startFakeCdpBrowser({ webSocketWithoutFrames: true });
     trackBrowser(browser);
-    const request = inspectWebPageInputSchema.parse({
-      cdp_endpoint: browser.endpoint,
-      allowed_origins: [browser.allowedOrigin],
-      target_id: "allowed-page",
-      observation_ms: 0,
-      include_console_text: true,
-      include_json_body_shapes: true,
-      include_websocket_shapes: true,
-    });
-    const result = await new CdpBrowserProvider().inspectPage(request);
-
-    if (!result.ok) throw result.error;
-    expect(result.value.console.events[0]?.text_capture).toEqual({
-      status: "included",
-      values: [
-        { argument_index: 0, type: "string", text: "authorization=[REDACTED]" },
-        { argument_index: 1, type: "number", text: "42" },
-      ],
-      retained_bytes: 26,
-    });
-    expect(result.value.network.requests[0]?.body_shapes.status).toBe(
-      "included",
+    const result = await new CdpBrowserProvider().inspectPage(
+      inspectWebPageInputSchema.parse({
+        cdp_endpoint: browser.endpoint,
+        allowed_origins: [browser.allowedOrigin],
+        target_id: "allowed-page",
+        observation_ms: 0,
+      }),
     );
-    expect(result.value.network.websocket_events[0]?.payload_shape).toEqual({
-      format: "json",
-      json_shape: expect.objectContaining({ root_type: "object" }),
-    });
+    if (!result.ok) throw result.error;
+    expect(result.value.network.websocket_connections).toEqual([
+      {
+        request_id: "websocket-1",
+        url: `ws://${new URL(browser.allowedOrigin).host}/live?token=websocket-url-secret`,
+        events: [],
+      },
+    ]);
   });
+});
 
+describe("CdpBrowserProvider: malformed approved payloads", () => {
   it("fails closed on malformed approved response and binary payload encodings", async () => {
     const browser = await startFakeCdpBrowser({
       invalidResponseBodyBase64: true,
@@ -337,9 +400,11 @@ describeBrowser("CdpBrowserProvider: complete sensitive data", () => {
       // The security-relevant claim: malformed base64 never yields a shape.
       response: null,
     });
-    expect(result.value.network.websocket_events[1]).toMatchObject({
+    expect(
+      result.value.network.websocket_connections[0]?.events[1],
+    ).toMatchObject({
       opcode: 2,
-      payload_bytes: 0,
+      payload_bytes: null,
       payload_shape: { format: "binary", json_shape: null },
     });
     expect(result.value.completeness.unavailable_sections).toEqual(
@@ -354,34 +419,16 @@ const expectSensitiveValuesAbsent = (
 ): void => {
   const serialized = JSON.stringify(inspection);
   for (const secret of [
-    "page-secret",
-    "frame-secret",
-    "dom-secret",
     "forbidden",
-    "resource-secret",
-    "script-secret",
-    "inline-secret",
-    "map-secret",
-    "network-secret",
-    "request-secret",
     "request-body-secret",
-    "response-secret",
     "response-body-secret",
     "websocket-secret",
-    "websocket-url-secret",
-    "console-secret",
     "unknown-origin-console-secret",
     "unknown-console-value-secret",
     "storage-secret",
     "cookie-secret",
     "indexed-db-secret",
     "cache-body-secret",
-    "secret-id",
-    "dom-url-secret",
-    "link-secret",
-    "csp-secret",
-    "hash-secret",
-    "header-secret",
   ])
     expect(serialized).not.toContain(secret);
   const methods = browser.commands.map((command) => command.method);

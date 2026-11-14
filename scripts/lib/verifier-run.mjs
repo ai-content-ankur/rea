@@ -33,13 +33,23 @@ export const completeVerifierRun = async (run) => {
   };
 };
 
+/** Require positive process-lineage evidence before claiming cleanup complete. */
+export const assertVerifierCleanupComplete = (processLineage) => {
+  if (processLineage.status !== "verified")
+    throw new Error(
+      `Verifier cleanup could not be verified: ${processLineage.reason}`,
+    );
+  if (processLineage.descendants.length !== 0)
+    throw new Error("Owned descendants survived verifier cleanup");
+};
+
 const observeVerifierLineage = async (run, observedAt) => {
   if (process.platform === "win32")
     return unavailableLineage(
       run,
       observedAt,
       null,
-      "Windows verifier lineage ownership is unavailable without Job Objects",
+      "The verifier has no retained native Job Object lease for lineage observation; provider jobs are verified by their native owners",
     );
   try {
     const { members, observerPid } = await processSnapshot();

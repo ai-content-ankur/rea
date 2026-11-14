@@ -7,10 +7,12 @@ import {
   completeVerifierRun,
   createVerifierRun,
 } from "../../scripts/lib/verifier-run.mjs";
+import { waitForExit } from "../support/process/processFixture.js";
 
 const execFileAsync = promisify(execFile);
+const CHILD_SHUTDOWN_GRACE_MS = 1_000;
 
-describe.sequential("verifier run identity", () => {
+describe("verifier run identity", { concurrent: false }, () => {
   it("allocates, propagates, and reuses one process-local identity", async () => {
     const previousRunId = process.env.REA_PROCESS_RUN_ID;
     process.env.REA_PROCESS_RUN_ID = "11111111-1111-4111-8111-111111111111";
@@ -123,11 +125,14 @@ const childReady = async (child: ChildProcess): Promise<void> => {
 
 const stopChild = async (child: ChildProcess): Promise<void> => {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise<void>((resolve) =>
-    child.once("exit", () => resolve()),
-  );
   child.kill("SIGTERM");
-  await exited;
+  if (await waitForExit(child, CHILD_SHUTDOWN_GRACE_MS)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForExit(child, CHILD_SHUTDOWN_GRACE_MS))) {
+    throw new Error(
+      `verifier child ${String(child.pid)} did not exit after SIGKILL`,
+    );
+  }
 };
 
 const restoreRunId = (runId: string | undefined): void => {

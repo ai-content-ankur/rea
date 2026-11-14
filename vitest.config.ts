@@ -3,131 +3,131 @@ import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { defineConfig } from "vitest/config";
+import { parseCLI } from "vitest/node";
+import {
+  BUILT_TEST_PROJECTS,
+  SOURCE_TEST_PROJECTS,
+} from "./scripts/lib/test-projects.mjs";
+
+import { CiTestSequencer } from "./tests/ciTestSequencer.js";
+import {
+  COVERAGE_DEADLINE_SCALE,
+  HOSTED_RUNNER_DEADLINE_SCALE,
+  LONG_RUNNING_DEADLINE_MS,
+  remainingTestDeadline,
+  TEST_DEADLINE_MS as BASE_TEST_DEADLINE_MS,
+} from "./tests/support/testDeadlines.js";
+
+// Playwright's registry does not derive a cache directory for Termux's
+// `android` platform. Match the production CLI fallback before workers import
+// browser modules.
+if (
+  process.platform === "android" &&
+  process.env.PLAYWRIGHT_BROWSERS_PATH === undefined
+) {
+  const cacheRoot =
+    process.env.XDG_CACHE_HOME ?? join(process.env.HOME ?? ".", ".cache");
+  process.env.PLAYWRIGHT_BROWSERS_PATH = join(cacheRoot, "ms-playwright");
+}
 
 const CANONICAL_TEMPORARY_DIRECTORY = realpathSync(tmpdir());
-const COVERAGE_ENABLED = process.argv.some((argument) =>
-  argument.startsWith("--coverage"),
+// Use Vitest's option parser so explicit false and spaced shard values retain
+// their meaning. Unknown worker/embedding arguments are not Vitest options.
+const { options: testOptions } = parseCLI(
+  ["vitest", ...process.argv.slice(2)],
+  { allowUnknownOptions: true },
 );
-const COVERAGE_SHARD = process.argv.some((argument) =>
-  argument.startsWith("--shard="),
+const COVERAGE_ENABLED = testOptions.coverage?.enabled === true;
+const COVERAGE_SHARD = testOptions.shard !== undefined;
+// Bound concurrency by the runner rather than command locks. A hosted CI job
+// owns its whole four-core runner, so it may use every core; other hosts stay
+// at two workers because developers and agents share them with other checks.
+const DEDICATED_CI_RUNNER = process.env.GITHUB_ACTIONS === "true";
+const MAX_TEST_WORKERS = Math.min(
+  DEDICATED_CI_RUNNER ? 4 : 2,
+  availableParallelism(),
 );
-// Local runs share the host with TypeScript, docs, and package checks under
-// Turbo. Running the suite on a single worker made a full local run cost ~140s
-// of wall time at ~100% CPU on a 10-core machine, which was the single largest
-// dev-cycle cost in the repository. Two workers matches the budget CI already
-// proves green, so local and CI now execute the same concurrency.
-//
-// Do not raise this without first removing the wall-clock-sensitive PTY
-// scenarios in tests/boundary/process, which fail under host contention
-// because they schedule actions by `at_ms` instead of observed output.
-const MAX_TEST_WORKERS = Math.min(2, availableParallelism());
+// A test deadline only turns a hang into a named failure; it is not a
+// performance assertion. Projects own it so tests do not hard-code host speed.
+// Built projects launch compiled CLI, MCP, and provider processes while other
+// lanes share the runner, and coverage instrumentation slows every lane. Hosted
+// CI runs a worker per core, so CPU-bound cases there share every core with
+// other workers and their subprocesses.
+const DEADLINE_SCALE =
+  (COVERAGE_ENABLED ? COVERAGE_DEADLINE_SCALE : 1) *
+  (DEDICATED_CI_RUNNER ? HOSTED_RUNNER_DEADLINE_SCALE : 1);
+const TEST_DEADLINE_MS = {
+  source: BASE_TEST_DEADLINE_MS.source * DEADLINE_SCALE,
+  built: BASE_TEST_DEADLINE_MS.built * DEADLINE_SCALE,
+} as const;
 
-// Cross-project scheduling is a local-host concern only. CI shards projects
-// across separate runners and already proves this concurrency green.
-const LOCAL_ONLY = process.env.CI !== "true";
+// Vitest's one-second `expect.poll` default is a host-speed guess. A poll the
+// project owns waits as long as its test may run, less a reporting reserve, so
+// a condition that never holds still fails with the poll's own diagnostics.
+const pollPolicy = (deadlineMs: number) => {
+  const timeout = remainingTestDeadline(deadlineMs, 0);
+  return timeout === undefined ? {} : { timeout };
+};
 
-const TEST_PROJECTS = [
-  {
-    name: "domain",
-    include: ["src/{contracts,domain}/**/*.test.ts"],
+const TEST_PROJECTS = [...SOURCE_TEST_PROJECTS, ...BUILT_TEST_PROJECTS];
+const PROJECT_POLICIES = {
+  domain: {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
     // Domain and contract modules are pure and own no process-global state, so
     // per-file module isolation adds startup cost without protecting a seam.
-    isolate: false,
   },
-  {
-    name: "services",
-    include: ["src/application/**/*.test.ts"],
+  services: {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
     // Service tests use recording ports and own no process-global state. Share
     // their module graph so file startup does not dominate the lane.
-    isolate: false,
   },
-  {
-    name: "adapters",
-    include: [
-      "src/*.test.ts",
-      "src/{artifacts,browser,dotnet,ghidra,hopper,native,process,reference,replay,server}/**/*.test.ts",
-    ],
-    pool: "forks" as const,
-    maxWorkers: MAX_TEST_WORKERS,
-  },
-  {
-    name: "composition",
-    include: ["tests/composition/**/*.test.ts"],
+  adapters: { pool: "forks" as const, maxWorkers: MAX_TEST_WORKERS },
+  composition: {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
+    // Composition tests use provider-neutral sessions and test-scoped cleanup;
+    // sharing their immutable module graph avoids per-file startup work.
   },
-  {
-    name: "boundary",
-    include: ["tests/boundary/**/*.test.ts"],
-    exclude: [
-      "tests/boundary/mcp/**/*.test.ts",
-      "tests/boundary/process/**/*.test.ts",
-    ],
+  boundary: { pool: "forks" as const, maxWorkers: MAX_TEST_WORKERS },
+  "cli-boundary": {
     pool: "forks" as const,
     maxWorkers: MAX_TEST_WORKERS,
+    // CLI tests create fresh command instances or subprocesses and own their
+    // cleanup. Reuse the immutable graph; module mocks belong in process-global.
+    // The shared source/contract graph also needs transient schema/help space.
+    // Ordinary CI exhausted 384 MiB after earlier files warmed that graph.
+    // Use the measured 512 MiB budget with the same bounded concurrency.
+    execArgv: ["--max-old-space-size=512"],
   },
-  {
-    // Real PTY capture scenarios contend for host process and terminal
-    // resources, and several still schedule actions by wall-clock `at_ms`
-    // rather than observed output. Running them concurrently with the rest of
-    // the boundary suite makes them drop input and lose resize echoes. They
-    // serialise until those scenarios trigger on observed terminal text.
-    name: "process-boundary",
-    include: ["tests/boundary/process/**/*.test.ts"],
+  "process-boundary": {
     pool: "forks" as const,
     maxWorkers: MAX_TEST_WORKERS,
+    // Process-tree observations share host sampling resources; keep this small
+    // lane serial while the independent projects run together.
     fileParallelism: false,
+    sequence: { groupOrder: 1 },
   },
-  {
-    name: "mcp-boundary",
-    include: ["tests/boundary/mcp/**/*.test.ts"],
+  "mcp-boundary": {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
     // Each file creates and closes an explicit in-memory MCP session. Reuse the
     // immutable server graph so module startup does not outweigh transport work.
-    isolate: false,
   },
-  {
-    name: "acceptance",
-    include: ["tests/acceptance/**/*.test.ts"],
-    pool: "forks" as const,
-    maxWorkers: MAX_TEST_WORKERS,
-    fileParallelism: false,
-  },
-  {
-    name: "process-global",
-    include: ["tests/process-global/**/*.test.ts"],
-    pool: "forks" as const,
-    maxWorkers: MAX_TEST_WORKERS,
-    fileParallelism: false,
-  },
-  {
-    name: "conformance",
-    include: ["tests/conformance/**/*.test.ts"],
+  acceptance: { pool: "forks" as const, maxWorkers: MAX_TEST_WORKERS },
+  "process-global": { pool: "forks" as const, maxWorkers: MAX_TEST_WORKERS },
+  conformance: {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
+    // Contract cases use recording providers and own no process-global state.
   },
-  {
-    name: "evaluation",
-    include: ["tests/evaluation/**/*.test.ts"],
+  evaluation: {
     pool: "threads" as const,
     maxWorkers: MAX_TEST_WORKERS,
+    // Evaluator tests inspect deterministic inputs without mutating shared state.
   },
-  // Acceptance, process-boundary, and process-global declare
-  // `fileParallelism: false` above because they own host-level process, stdio,
-  // and terminal state. That flag only serialises files inside one project, so
-  // each project also needs its own `sequence.groupOrder` locally: without it
-  // Vitest runs projects concurrently and a project that mutates host process
-  // or terminal state overlaps with projects that observe it.
-].map((project, groupOrder) => ({
-  ...project,
-  maxWorkers: MAX_TEST_WORKERS,
-  ...(LOCAL_ONLY ? { sequence: { groupOrder } } : {}),
-}));
+};
 
 const ZERO_COVERAGE_THRESHOLDS = {
   statements: 0,
@@ -148,22 +148,50 @@ const ZERO_COVERAGE_THRESHOLDS = {
   },
 };
 
-const projects = TEST_PROJECTS.map((project) => ({
-  extends: true as const,
-  test: project,
-}));
+const projects = TEST_PROJECTS.map((project) => {
+  const policy =
+    PROJECT_POLICIES[project.name as keyof typeof PROJECT_POLICIES];
+  if (!policy)
+    throw new Error(`Missing test runner policy for ${project.name}`);
+  return {
+    extends: true as const,
+    test: {
+      name: project.name,
+      include: [...project.include],
+      ...(project.exclude ? { exclude: [...project.exclude] } : {}),
+      isolate: project.isolate !== false,
+      testTimeout: TEST_DEADLINE_MS[project.group],
+      hookTimeout: TEST_DEADLINE_MS[project.group],
+      expect: { poll: pollPolicy(TEST_DEADLINE_MS[project.group]) },
+      ...policy,
+    },
+  };
+});
 
 export default defineConfig({
   test: {
     env: { TMPDIR: CANONICAL_TEMPORARY_DIRECTORY },
     maxWorkers: MAX_TEST_WORKERS,
     projects,
+    ...(process.env.REA_CI_TEST_HISTORY
+      ? { sequence: { sequencer: CiTestSequencer } }
+      : {}),
     retry: 0,
     reporters: ["default"],
-    // Boundary projects may compete with TypeScript, docs, and package checks
-    // under Turbo. Keep the deadline bounded while avoiding false failures from
-    // host-level CPU and filesystem contention.
-    testTimeout: COVERAGE_ENABLED ? 60_000 : 30_000,
+    runner: "./tests/processOwnershipRunner.ts",
+    testTimeout: TEST_DEADLINE_MS.source,
+    hookTimeout: TEST_DEADLINE_MS.source,
+    expect: { poll: pollPolicy(TEST_DEADLINE_MS.source) },
+    // Deadline probes compare what Vitest applies with the configured policy.
+    provide: { testDeadlineScale: DEADLINE_SCALE },
+    tags: [
+      {
+        name: "long-running",
+        description:
+          "A bounded workload that needs more than its project's deadline",
+        timeout: LONG_RUNNING_DEADLINE_MS * DEADLINE_SCALE,
+      },
+    ],
     coverage: {
       enabled: false,
       provider: "v8",
@@ -196,3 +224,9 @@ export default defineConfig({
     },
   },
 });
+
+declare module "vitest" {
+  export interface ProvidedContext {
+    readonly testDeadlineScale: number;
+  }
+}

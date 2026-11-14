@@ -1,19 +1,24 @@
+import type { BigIntStats } from "node:fs";
 import { constants } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 
 import { err, ok } from "../domain/result.js";
-import { cancelled, failure } from "./ReferenceSourceReaderErrors.js";
-import { isPathWithinRoot } from "../domain/localPath.js";
 import {
-  type BigStats,
-  type ReferenceSourceFailureCode,
-  type ReferenceSourceResult,
+  cancelled,
+  failure,
+  filesystemFailureDetail,
+  rootFilesystemFailure,
+} from "./ReferenceSourceReaderErrors.js";
+import { isPathWithinRoot } from "../domain/localPath.js";
+import type {
+  ReferenceSourceFailureCode,
+  ReferenceSourceResult,
 } from "./ReferenceSourceReaderTypes.js";
 
-export const bigLstat = (path: string): Promise<BigStats> =>
+export const bigLstat = (path: string): Promise<BigIntStats> =>
   lstat(path, { bigint: true });
 
-export const sameFile = (left: BigStats, right: BigStats): boolean =>
+export const sameFile = (left: BigIntStats, right: BigIntStats): boolean =>
   left.dev === right.dev &&
   left.ino === right.ino &&
   left.size === right.size &&
@@ -28,16 +33,24 @@ export const noFollowOpenSupported = (): boolean =>
 
 export const validateDirectory = async (
   root: string,
-  rootIdentity: BigStats,
+  rootIdentity: BigIntStats,
   path: string,
+  signal?: AbortSignal,
 ): Promise<
-  | { readonly ok: true; readonly stats: BigStats }
+  | { readonly ok: true; readonly stats: BigIntStats }
   | {
       readonly ok: false;
       readonly code: ReferenceSourceFailureCode;
       readonly message: string;
+      readonly localDiagnostic?: string;
     }
 > => {
+  if (isAborted(signal))
+    return {
+      ok: false,
+      code: "cancelled",
+      message: "Reference source traversal cancelled",
+    };
   try {
     const rootNow = await bigLstat(root);
     if (!sameFile(rootIdentity, rootNow))
@@ -63,11 +76,16 @@ export const validateDirectory = async (
         message: "Directory escaped the reference root",
       };
     return { ok: true, stats };
-  } catch {
+  } catch (cause: unknown) {
+    const detail = filesystemFailureDetail(
+      cause,
+      "Directory identity could not be verified",
+    );
+    if (detail === undefined) throw cause;
     return {
       ok: false,
       code: "io",
-      message: "Directory identity could not be verified",
+      ...detail,
     };
   }
 };
@@ -78,30 +96,42 @@ export const prepareRoot = async (
 ): Promise<
   ReferenceSourceResult<{
     readonly canonicalRoot: string;
-    readonly rootIdentity: BigStats;
+    readonly rootIdentity: BigIntStats;
   }>
 > => {
-  if (isAborted(signal)) return err(cancelled());
+  if (isAborted(signal)) return err(cancelled(signal));
   try {
     const metadata = await bigLstat(root);
     if (metadata.isSymbolicLink() || !metadata.isDirectory())
       return err(
-        failure("invalid-root", "Reference source root must be a directory"),
+        failure(
+          "invalid-root",
+          `Reference source root is not a directory: ${root}`,
+        ),
       );
     const canonicalRoot = await realpath(root);
-    if (isAborted(signal)) return err(cancelled());
+    if (isAborted(signal)) return err(cancelled(signal));
     const canonicalMetadata = await bigLstat(canonicalRoot);
     if (!sameFile(metadata, canonicalMetadata))
       return err(
         failure(
           "invalid-root",
-          "Reference source root changed during resolution",
+          `Reference source root changed during resolution: ${root}`,
         ),
       );
     return ok({ canonicalRoot, rootIdentity: canonicalMetadata });
-  } catch {
-    return err(
-      failure("invalid-root", "Reference source root could not be resolved"),
+  } catch (cause: unknown) {
+    const rootFailure = rootFilesystemFailure(
+      cause,
+      "Reference source root could not be resolved",
     );
+    if (rootFailure === undefined) throw cause;
+    return err({
+      ...failure(rootFailure.code, `${rootFailure.message}: ${root}`),
+      ...(rootFailure.remediationAction === undefined
+        ? {}
+        : { remediationAction: rootFailure.remediationAction }),
+      cause,
+    });
   }
 };

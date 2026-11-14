@@ -2,8 +2,8 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { createEvidence } from "../dist/domain/evidence.js";
-import { buildManagedPeFixture } from "./lib/managed-pe-fixture.mjs";
-import { functionDossier, json, run } from "./lib/verify-package-core.mjs";
+import { buildManagedPeFixture } from "./fixtures/managed/pe.mjs";
+import { functionDossier } from "./fixtures/managed/function-dossier.mjs";
 
 const buildManagedFixtures = async (workspace) => {
   const managedPath = join(workspace, "managed-fixture.exe");
@@ -12,10 +12,15 @@ const buildManagedFixtures = async (workspace) => {
     writeFile(
       managedPath,
       buildManagedPeFixture({
+        methods: [
+          { name: "Main", flags: 0x0016 },
+          { name: "NativeMessageBox", flags: 0x2016, rva: 0 },
+        ],
         pinvoke: {
           moduleName: "user32.dll",
           importName: "MessageBoxW",
           mappingFlags: 0x0345,
+          memberRow: 2,
         },
       }),
     ),
@@ -32,9 +37,14 @@ const buildManagedFixtures = async (workspace) => {
   return { managedPath, managedRightPath };
 };
 
-const verifyManagedArtifact = async ({ cli, managedPath, environment }) => {
-  const managedArtifact = json(
-    await run(
+const verifyManagedArtifact = async ({
+  commands,
+  cli,
+  managedPath,
+  environment,
+}) => {
+  const managedArtifact = JSON.parse(
+    await commands.run(
       cli,
       ["inspect-managed-artifact", managedPath, "--json"],
       environment,
@@ -49,9 +59,14 @@ const verifyManagedArtifact = async ({ cli, managedPath, environment }) => {
   return managedArtifact;
 };
 
-const verifyManagedMembers = async ({ cli, managedPath, environment }) => {
-  const managedMembers = json(
-    await run(
+const verifyManagedMembers = async ({
+  commands,
+  cli,
+  managedPath,
+  environment,
+}) => {
+  const managedMembers = JSON.parse(
+    await commands.run(
       cli,
       ["inspect-managed-members", managedPath, "--json"],
       environment,
@@ -59,13 +74,14 @@ const verifyManagedMembers = async ({ cli, managedPath, environment }) => {
   );
   if (
     managedMembers.operation !== "inspect_managed_members" ||
-    managedMembers.normalized_result?.methods?.length !== 1
+    managedMembers.normalized_result?.methods?.length !== 2
   )
     throw new Error("packaged managed member CLI failed");
   return managedMembers;
 };
 
 const verifyManagedReconstruction = async ({
+  commands,
   cli,
   managedMembers,
   managedMethod,
@@ -94,8 +110,8 @@ const verifyManagedReconstruction = async ({
     ],
     notes: ["packaged synthetic reconstruction import"],
   };
-  const managedReconstruction = json(
-    await run(
+  const managedReconstruction = JSON.parse(
+    await commands.run(
       cli,
       [
         "import-managed-reconstruction",
@@ -115,67 +131,14 @@ const verifyManagedReconstruction = async ({
     throw new Error("packaged managed reconstruction import CLI failed");
 };
 
-const verifyManagedRuntimePlan = async ({
+const verifyManagedBoundaries = async ({
+  commands,
   cli,
-  managedMembers,
-  managedMethod,
-  workspace,
+  managedPath,
   environment,
 }) => {
-  const managedRuntimePlanInput = {
-    static_members: managedMembers,
-    method: {
-      token: managedMethod.token,
-      signature_sha256: managedMethod.signature.raw_sha256,
-      normalized_il_sha256: managedMethod.body.normalized_il_sha256,
-    },
-    requested_effect: "attach",
-    host: {
-      os: "linux",
-      clr_family: "dotnet",
-      architecture: "x86_64",
-    },
-    bounds: {
-      timeout_ms: 5_000,
-      max_threads: 32,
-      max_output_bytes: 65_536,
-      allow_network: false,
-      allow_ui: false,
-    },
-  };
-  const managedRuntimePlan = json(
-    await run(
-      cli,
-      [
-        "plan-managed-runtime-correlation",
-        JSON.stringify(managedRuntimePlanInput),
-        "--json",
-      ],
-      {
-        ...environment,
-        REA_MANAGED_RUNTIME_ENABLED: "true",
-        REA_MANAGED_RUNTIME_ROOTS_JSON: JSON.stringify([workspace]),
-        REA_MANAGED_RUNTIME_EXECUTABLE_PATH: process.execPath,
-      },
-    ),
-  );
-  if (
-    managedRuntimePlan.operation !== "plan_managed_runtime_correlation" ||
-    managedRuntimePlan.provider?.id !== "rea-dotnet-workflows" ||
-    managedRuntimePlan.normalized_result?.executed !== false ||
-    managedRuntimePlan.normalized_result?.authority_model?.capability !==
-      "managed_runtime" ||
-    managedRuntimePlan.normalized_result?.effect_taxonomy?.attaches_process !==
-      true ||
-    managedRuntimePlan.normalized_result?.effect_taxonomy
-      ?.invokes_target_code !== false
-  )
-    throw new Error("packaged managed runtime-correlation CLI failed");
-};
-
-const verifyManagedBoundaries = async ({ cli, managedPath, environment }) => {
-  const managedBoundaries = json(
-    await run(
+  const managedBoundaries = JSON.parse(
+    await commands.run(
       cli,
       ["inspect-managed-native-boundaries", managedPath, "--json"],
       environment,
@@ -192,6 +155,7 @@ const verifyManagedBoundaries = async ({ cli, managedPath, environment }) => {
 };
 
 const verifyManagedApplicationGraph = async ({
+  commands,
   cli,
   managedArtifact,
   managedMembers,
@@ -209,8 +173,8 @@ const verifyManagedApplicationGraph = async ({
       "inspect_managed_native_boundaries",
     ),
   };
-  const managedApplicationGraph = json(
-    await run(
+  const managedApplicationGraph = JSON.parse(
+    await commands.run(
       cli,
       [
         "project-managed-application-graph",
@@ -261,6 +225,7 @@ const managedEvidence = (output, operation) => {
 };
 
 const verifyManagedNativeVerification = async ({
+  commands,
   cli,
   managedBoundaries,
   environment,
@@ -294,8 +259,8 @@ const verifyManagedNativeVerification = async ({
       ),
     ],
   };
-  const managedNativeVerification = json(
-    await run(
+  const managedNativeVerification = JSON.parse(
+    await commands.run(
       cli,
       [
         "verify-managed-native-boundaries",
@@ -317,13 +282,14 @@ const verifyManagedNativeVerification = async ({
 };
 
 const verifyManagedComparison = async ({
+  commands,
   cli,
   managedPath,
   managedRightPath,
   environment,
 }) => {
-  const managedComparison = json(
-    await run(
+  const managedComparison = JSON.parse(
+    await commands.run(
       cli,
       ["compare-managed-members", managedPath, managedRightPath, "--json"],
       environment,
@@ -332,45 +298,44 @@ const verifyManagedComparison = async ({
   if (
     managedComparison.operation !== "compare_managed_members" ||
     managedComparison.provider?.id !== "rea-dotnet-workflows" ||
-    managedComparison.normalized_result?.algorithm?.name_matching !== "not-used"
+    managedComparison.normalized_result?.algorithm?.name_matching !==
+      "exact-signature-fallback"
   )
     throw new Error("packaged managed comparison CLI failed");
 };
 
 /** Exercise all packaged managed static and workflow CLIs. */
-export async function verifyManaged({ cli, workspace, environment }) {
+export async function verifyManaged({ commands, cli, workspace, environment }) {
   const { managedPath, managedRightPath } =
     await buildManagedFixtures(workspace);
   const managedArtifact = await verifyManagedArtifact({
+    commands,
     cli,
     managedPath,
     environment,
   });
   const managedMembers = await verifyManagedMembers({
+    commands,
     cli,
     managedPath,
     environment,
   });
   const managedMethod = managedMembers.normalized_result.methods[0];
   await verifyManagedReconstruction({
+    commands,
     cli,
     managedMembers,
     managedMethod,
-    environment,
-  });
-  await verifyManagedRuntimePlan({
-    cli,
-    managedMembers,
-    managedMethod,
-    workspace,
     environment,
   });
   const managedBoundaries = await verifyManagedBoundaries({
+    commands,
     cli,
     managedPath,
     environment,
   });
   await verifyManagedApplicationGraph({
+    commands,
     cli,
     managedArtifact,
     managedMembers,
@@ -378,11 +343,13 @@ export async function verifyManaged({ cli, workspace, environment }) {
     environment,
   });
   await verifyManagedNativeVerification({
+    commands,
     cli,
     managedBoundaries,
     environment,
   });
   await verifyManagedComparison({
+    commands,
     cli,
     managedPath,
     managedRightPath,

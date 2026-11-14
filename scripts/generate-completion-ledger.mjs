@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { ensureGeneratedFile } from "./lib/generated-file.mjs";
+import { importVerifierSource } from "./lib/verifier-source-loader.mjs";
 
 const exec = promisify(execFile);
 const arguments_ = new Set(process.argv.slice(2));
@@ -22,7 +23,7 @@ delete verifierEnvironment.REA_ILSPY_CMD_PATH;
 
 const { stdout } = await exec(
   process.execPath,
-  [join(root, "scripts/verify-managed-conformance.mjs")],
+  [join(root, "scripts/verify/managed/conformance.mjs")],
   {
     cwd: root,
     env: verifierEnvironment,
@@ -30,7 +31,7 @@ const { stdout } = await exec(
   },
 );
 const verifierOutput = JSON.parse(stdout);
-// Managed conformance claims are host-independent. Keep the checked-in
+// Managed conformance claims are host-independent. Keep the generated
 // commitment reproducible across macOS, Linux, and Windows rather than
 // embedding the machine that happened to generate it.
 const portableCompletionReport = {
@@ -42,8 +43,9 @@ const portableCompletionReport = {
     runtime_version: "portable",
   },
 };
-const { createCompletionLedgerArtifacts } = await import(
-  `../dist/domain/completionLedgerGeneration.js?${String(Date.now())}`
+const { createCompletionLedgerArtifacts } = await importVerifierSource(
+  "./lib/completion-ledger-generation.mts",
+  import.meta.url,
 );
 const skillDigest = await directoryDigest(
   join(root, "skills/reverse-engineer-anything"),

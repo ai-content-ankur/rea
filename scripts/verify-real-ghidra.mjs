@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { verifyProjectCoverage } from "./verify-real-ghidra-project-coverage.mjs";
+
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,12 +12,10 @@ import { promisify } from "node:util";
 import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
 import { resolveGhidraAnalysisProfile } from "../dist/ghidra/GhidraAnalysisProfile.js";
 import { GhidraClient } from "../dist/ghidra/GhidraClient.js";
-import {
-  inspectGhidraInstallation,
-  SUPPORTED_GHIDRA_VERSION,
-} from "../dist/ghidra/GhidraInstallation.js";
+import { inspectVerifierGhidraInstallation } from "./lib/ghidra-installation-inspection.mjs";
+import { SUPPORTED_GHIDRA_VERSION } from "../dist/ghidra/GhidraReleasePolicy.js";
 import { GhidraHeadlessLauncher } from "../dist/ghidra/GhidraLauncher.js";
-import { GHIDRA_PROVIDER_IDENTITY } from "../dist/ghidra/GhidraProvider.js";
+import { GHIDRA_PROVIDER_IDENTITY } from "../dist/ghidra/GhidraProviderMetadata.js";
 
 import {
   assertCleanup,
@@ -33,20 +33,27 @@ import {
   verifyInventoryOperations,
 } from "./verify-real-ghidra-inventory.mjs";
 import { completeVerifierRun, createVerifierRun } from "./lib/verifier-run.mjs";
+import { hasTypedSwitchEvidence } from "./verify-real-ghidra-switch-assertions.mjs";
+import { verifyGhidraRelocationSymbols } from "./lib/real-ghidra-relocation-symbols.mjs";
 
 import {
+  verifyDenseDefaultReturn,
+  verifyJumpTableDenseSwitch,
   verifyNativeTypeLayout,
   verifyRelativeSwitch,
+  verifyRelativeSignedSwitch,
   verifyNativeValueTrace,
 } from "./verify-real-ghidra-function.mjs";
 const exec = promisify(execFile);
 const verifierRun = createVerifierRun();
+let report;
 const installDir = process.env.GHIDRA_INSTALL_DIR;
 if (installDir === undefined || !isAbsolute(installDir))
   throw new Error(
     "Set GHIDRA_INSTALL_DIR to the absolute root of an extracted Ghidra 12.1.4 release.",
   );
-const installation = inspectGhidraInstallation({
+const installation = await inspectVerifierGhidraInstallation({
+  environment: process.env,
   installDir,
   ...(process.env.JAVA_HOME === undefined
     ? {}
@@ -78,6 +85,7 @@ const crossFormatSourcePath = fileURLToPath(
 const debugPath = join(fixtureRoot, "rea-ghidra-inventory-debug");
 const layoutPath = join(fixtureRoot, "rea-ghidra-layout.o");
 const strippedPath = join(fixtureRoot, "rea-ghidra-inventory-stripped");
+const jumpTablePath = join(fixtureRoot, "rea-ghidra-inventory-jump");
 const arm64ElfPath = join(fixtureRoot, "rea-ghidra-cross-arm64");
 const peObjectPath = join(fixtureRoot, "rea-ghidra-cross-x86_64.obj");
 const pePath = join(fixtureRoot, "rea-ghidra-cross-x86_64.exe");
@@ -132,6 +140,14 @@ try {
   if (expectedNativeTarget.format === "mach-o")
     strippedFlags.push("-fvisibility=hidden");
   await exec(compiler, [...strippedFlags, sourcePath, "-o", strippedPath]);
+  // The dense jump-table oracle needs the switch lowered to a table: GCC 16 and
+  // later expand dense switches as compare chains at -O0, so the CLI oracle
+  // runs against an optimized build while the debug fixture keeps its -O0
+  // stack-local and DWARF shape.
+  const jumpTableFlags = ["-O2", "-g", "-fno-inline"];
+  if (expectedNativeTarget.format === "elf")
+    jumpTableFlags.push("-fno-pie", "-no-pie");
+  await exec(compiler, [...jumpTableFlags, sourcePath, "-o", jumpTablePath]);
   const crossTargets = [];
   if (aarch64JumpTableOnly) {
     const relativeSource = fileURLToPath(
@@ -157,6 +173,36 @@ try {
         crossTargets.push([
           targetPath,
           `relative-${entrySize}`,
+          { format, architecture: "arm64" },
+        ]);
+      }
+    }
+    const signedRelativeSource = fileURLToPath(
+      new URL(
+        "../tests/conformance/ghidra/relative-switch-signed.S",
+        import.meta.url,
+      ),
+    );
+    for (const selectorBias of [0, 2, 10]) {
+      for (const format of [
+        "elf",
+        ...(expectedNativeTarget.architecture === "arm64" ? ["mach-o"] : []),
+      ]) {
+        const targetPath = join(
+          fixtureRoot,
+          `relative-signed-${selectorBias}-${format}.o`,
+        );
+        await exec(clang, [
+          ...(format === "elf" ? ["--target=aarch64-linux-gnu"] : []),
+          `-DREA_SELECTOR_BIAS=${selectorBias}`,
+          "-c",
+          signedRelativeSource,
+          "-o",
+          targetPath,
+        ]);
+        crossTargets.push([
+          targetPath,
+          `relative-signed-${selectorBias}`,
           { format, architecture: "arm64" },
         ]);
       }
@@ -238,6 +284,14 @@ try {
   }
   await writeFile(malformedPath, Buffer.from("not-a-binary\n", "utf8"));
 
+  const relocationSymbols = crossFormat
+    ? await verifyGhidraRelocationSymbols({
+        clang,
+        lld,
+        env: process.env,
+      })
+    : null;
+
   const debug = await verifyTarget(debugPath, "debug", expectedNativeTarget);
   assertDebugFixture(debug);
   const layout = await verifyTarget(
@@ -251,6 +305,11 @@ try {
     expectedNativeTarget,
   );
   assertStrippedFixture(stripped);
+  const jumpTable = await verifyTarget(
+    jumpTablePath,
+    "jump-table",
+    expectedNativeTarget,
+  );
   const crossResults = [];
   for (const [targetPath, variant, expectedTarget] of crossTargets) {
     const result = await verifyTarget(targetPath, variant, expectedTarget);
@@ -263,44 +322,53 @@ try {
   const customPath = process.env.GHIDRA_TARGET_PATH;
   const custom =
     customPath === undefined ? null : await verifyTarget(customPath, "custom");
-  process.stdout.write(
-    `${JSON.stringify({
-      verifier_run: await completeVerifierRun(verifierRun),
-      ok: true,
-      provider: { id: "ghidra", version: SUPPORTED_GHIDRA_VERSION },
-      verification_lane: aarch64JumpTableOnly
-        ? "aarch64-jump-table"
-        : crossFormat
-          ? "cross-format"
-          : "host-native",
-      fixture_sources:
-        crossFormat || aarch64JumpTableOnly
-          ? [sourcePath, crossFormatSourcePath]
-          : [sourcePath],
-      fixtures: [debug, stripped, layout, ...crossResults].map(summary),
-      malformed_target: "rejected-before-provider-start",
-      native_api_cli: aarch64JumpTableOnly
-        ? (crossResults[0]?.native_api_cli ?? null)
-        : debug.native_api_cli,
-      native_value_e2e: debug.native_values,
-      custom_target: custom === null ? null : summary(custom),
-      cleanup: "complete",
-    })}\n`,
-  );
+  const projectCoverage =
+    !crossFormat && !aarch64JumpTableOnly && process.platform !== "win32"
+      ? await verifyProjectCoverage(verifierRun)
+      : null;
+  report = {
+    ok: true,
+    provider: { id: "ghidra", version: SUPPORTED_GHIDRA_VERSION },
+    verification_lane: aarch64JumpTableOnly
+      ? "aarch64-jump-table"
+      : crossFormat
+        ? "cross-format"
+        : "host-native",
+    fixture_sources:
+      crossFormat || aarch64JumpTableOnly
+        ? [sourcePath, crossFormatSourcePath]
+        : [sourcePath],
+    fixtures: [debug, stripped, layout, jumpTable, ...crossResults].map(
+      summary,
+    ),
+    malformed_target: "rejected-before-provider-start",
+    native_api_cli: aarch64JumpTableOnly
+      ? (crossResults[0]?.native_api_cli ?? null)
+      : jumpTable.native_api_cli,
+    native_value_e2e: debug.native_values,
+    selected_project_coverage: projectCoverage,
+    relocation_symbols: relocationSymbols,
+    custom_target: custom === null ? null : summary(custom),
+    cleanup: "complete",
+  };
 } finally {
   await rm(fixtureRoot, { recursive: true, force: true });
 }
+process.stdout.write(
+  `${JSON.stringify({ verifier_run: await completeVerifierRun(verifierRun), ...report })}\n`,
+);
 
 function nativeFixtureTarget(platform, architecture) {
   const supportedTargets = {
     "darwin-arm64": { format: "mach-o", architecture: "arm64" },
     "darwin-x64": { format: "mach-o", architecture: "x86_64" },
     "linux-x64": { format: "elf", architecture: "x86_64" },
+    "linux-arm64": { format: "elf", architecture: "arm64" },
   };
   const target = supportedTargets[`${platform}-${architecture}`];
   if (target === undefined)
     throw new Error(
-      `The Ghidra verifier does not support a host-native fixture on ${platform}/${architecture}; use a supported Linux x64 or macOS x64/arm64 host.`,
+      `The Ghidra verifier does not support a host-native fixture on ${platform}/${architecture}; use a supported Linux or macOS x64/arm64 host.`,
     );
   return target;
 }
@@ -308,8 +376,7 @@ function nativeFixtureTarget(platform, architecture) {
 async function verifyNativeApiCli(
   targetPath,
   procedures,
-  requireDenseJumpTable,
-  denseSwitchSymbol = "rea_ghidra_inventory_dense_switch",
+  { requireDenseJumpTable, denseSwitchSymbol, client },
 ) {
   const denseSwitch = procedures.find(({ value }) =>
     value.endsWith(denseSwitchSymbol),
@@ -349,11 +416,25 @@ async function verifyNativeApiCli(
       (mapping) =>
         mapping.case_value === caseValue &&
         mapping.confidence === "high" &&
-        mapping.evidence.some(
-          ({ detail }) =>
-            detail.includes(`case value ${caseValue} with target`) ||
-            detail.startsWith(`Case value ${caseValue} indexes byte `),
-        ),
+        (hasTypedSwitchEvidence(
+          mapping.evidence,
+          `Typed case value ${caseValue}`,
+          mapping.target_address,
+          denseTable.dispatch_address,
+        ) ||
+          mapping.evidence.some(
+            ({ kind, source, detail }) =>
+              kind === "jump-table" &&
+              typeof detail === "string" &&
+              detail.trim().length > 0 &&
+              ((source === "ghidra-high-function" &&
+                detail.includes(
+                  `case value ${caseValue} with target ${mapping.target_address}`,
+                )) ||
+                (source === "ghidra-instruction-and-memory" &&
+                  detail.startsWith(`Case value ${caseValue} indexes byte `) &&
+                  detail.includes(`reaching ${mapping.target_address}.`))),
+          )),
     ),
   );
   if (
@@ -368,7 +449,20 @@ async function verifyNativeApiCli(
   if (
     requireDenseJumpTable &&
     (denseTable === undefined ||
-      denseCases.size !== denseTable.mappings.length ||
+      denseCases.size !== expectedCases.length ||
+      denseTable.mappings.length !== expectedCases.length ||
+      denseTable.default_targets.length !== 1 ||
+      denseTable.default_targets[0].confidence !== "high" ||
+      !hasTypedSwitchEvidence(
+        denseTable.default_targets[0].evidence,
+        "Typed default label",
+        denseTable.default_targets[0].target_address,
+        denseTable.dispatch_address,
+      ) ||
+      denseTable.mappings.some(
+        ({ target_address }) =>
+          target_address === denseTable.default_targets[0].target_address,
+      ) ||
       expectedCases.some((caseValue) => !denseCases.has(caseValue)) ||
       !mappingsAreExact ||
       evidence.normalized_result?.residual_unknowns?.length !== 0)
@@ -376,10 +470,17 @@ async function verifyNativeApiCli(
     throw new Error(
       `The shipped inspect-native-api CLI did not preserve complete dense jump-table output: ${stdout}`,
     );
+  const defaultOracle = requireDenseJumpTable
+    ? await verifyDenseDefaultReturn(
+        client,
+        denseTable.default_targets[0].target_address,
+      )
+    : null;
   return {
     operation: evidence.operation,
     provider: evidence.provider,
     mappings_returned: denseTable?.mappings.length ?? null,
+    default_oracle: defaultOracle,
     residual_unknowns: evidence.normalized_result.residual_unknowns.length,
   };
 }
@@ -405,10 +506,10 @@ async function verifyTarget(targetPath, variant, expectedTarget = null) {
 
   const client = new GhidraClient({
     launcher: new GhidraHeadlessLauncher({
+      configurationDirectoryName: installation.configurationDirectoryName,
+      environment: process.env,
       analyzeHeadlessPath: installation.analyzeHeadlessPath,
-      ...(process.env.JAVA_HOME === undefined
-        ? {}
-        : { javaHome: process.env.JAVA_HOME }),
+      javaHome: installation.javaHome,
       bridgeScriptPath: fileURLToPath(
         new URL("../bridge/ghidra/ReaGhidraBridge.java", import.meta.url),
       ),
@@ -421,6 +522,7 @@ async function verifyTarget(targetPath, variant, expectedTarget = null) {
   });
 
   let runtimeCoordinates;
+  let primaryFailure;
   try {
     const started = await client.start();
     if (!started.ok) throw started.error;
@@ -455,35 +557,42 @@ async function verifyTarget(targetPath, variant, expectedTarget = null) {
     const crossArm64Elf =
       variant === "cross-arm64-elf" || variant === "aarch64-jump-table";
     const nativeApiCli =
-      variant === "debug" || crossArm64Elf
-        ? await verifyNativeApiCli(
-            parsedTarget.value.path,
-            procedures,
-            crossArm64Elf ||
+      variant === "jump-table" || crossArm64Elf
+        ? await verifyNativeApiCli(parsedTarget.value.path, procedures, {
+            requireDenseJumpTable:
+              crossArm64Elf ||
               (expectedNativeTarget.format === "elf" &&
                 expectedNativeTarget.architecture === "x86_64"),
-            crossArm64Elf
+            denseSwitchSymbol: crossArm64Elf
               ? "rea_cross_dense_switch"
               : "rea_ghidra_inventory_dense_switch",
-          )
+            client,
+          })
         : null;
-    const probes = variant.startsWith("relative-")
-      ? await verifyRelativeSwitch(
+    const probes = variant.startsWith("relative-signed-")
+      ? await verifyRelativeSignedSwitch(
           client,
-          procedures,
-          Number(variant.slice(-1)),
+          Number(variant.split("-").at(-1)),
         )
-      : variant === "type-layout"
-        ? await verifyNativeTypeLayout(client, names)
-        : variant === "custom" || variant === "aarch64-jump-table"
-          ? null
-          : await verifyInventoryOperations({
-              client,
-              variant,
-              procedures,
-              names,
-              strings,
-            });
+      : variant.startsWith("relative-")
+        ? await verifyRelativeSwitch(
+            client,
+            procedures,
+            Number(variant.slice(-1)),
+          )
+        : variant === "type-layout"
+          ? await verifyNativeTypeLayout(client, names)
+          : variant === "jump-table"
+            ? await verifyJumpTableDenseSwitch(client, procedures)
+            : variant === "custom" || variant === "aarch64-jump-table"
+              ? null
+              : await verifyInventoryOperations({
+                  client,
+                  variant,
+                  procedures,
+                  names,
+                  strings,
+                });
     const nativeValues =
       variant === "debug"
         ? await verifyNativeValueTrace(client, procedures, parsedTarget.value)
@@ -502,8 +611,18 @@ async function verifyTarget(targetPath, variant, expectedTarget = null) {
       native_api_cli: nativeApiCli,
       native_values: nativeValues,
     };
+  } catch (cause) {
+    primaryFailure = cause;
+    throw cause;
   } finally {
-    await client.close();
+    const closed = await client.close();
+    if (!closed.ok)
+      throw primaryFailure === undefined
+        ? closed.error
+        : new AggregateError(
+            [primaryFailure, closed.error],
+            "Ghidra verification and cleanup failed",
+          );
     if (runtimeCoordinates !== undefined)
       await assertCleanup(runtimeCoordinates);
   }

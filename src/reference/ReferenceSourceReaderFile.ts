@@ -1,17 +1,30 @@
-import { constants } from "node:fs";
-import { open, type FileHandle } from "node:fs/promises";
+import { regularFileCancellation } from "../filesystem/OwnedRegularFile.js";
+import type { BigIntStats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { entryFailure, safeSize } from "./ReferenceSourceReaderErrors.js";
+import {
+  NonRegularFileReadError,
+  RegularFileAdmissionFailure,
+  openRegularFile,
+} from "../filesystem/RegularFile.js";
+import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import type { AnalysisCleanupObservation } from "../domain/analysisErrorBase.js";
+
+import {
+  entryFailure,
+  filesystemFailureDetail,
+  safeSize,
+} from "./ReferenceSourceReaderErrors.js";
 import {
   isAborted,
   sameFile,
   validateDirectory,
 } from "./ReferenceSourceReaderValidate.js";
-import {
-  type BigStats,
-  type ReferenceSourceEntry,
-  type StableFileRequest,
+import type {
+  ReferenceSourceEntry,
+  StableFileRequest,
 } from "./ReferenceSourceReaderTypes.js";
 
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -19,7 +32,7 @@ const READ_CHUNK_BYTES = 64 * 1024;
 type PreparedFileRead =
   | {
       readonly status: "ready";
-      readonly before: BigStats;
+      readonly before: BigIntStats;
     }
   | { readonly status: "failed"; readonly entry: ReferenceSourceEntry };
 
@@ -29,14 +42,15 @@ type FileContentsRead =
 
 type FinalizeFileReadRequest = {
   readonly root: string;
-  readonly rootIdentity: BigStats;
+  readonly rootIdentity: BigIntStats;
   readonly absolute: string;
   readonly path: string;
   readonly handle: FileHandle;
-  readonly before: BigStats;
-  readonly parentBefore: { readonly ok: true; readonly stats: BigStats };
+  readonly before: BigIntStats;
+  readonly parentBefore: { readonly ok: true; readonly stats: BigIntStats };
   readonly chunks: Buffer[];
   readonly total: number;
+  readonly signal?: AbortSignal;
 };
 
 const prepareFileRead = async (
@@ -72,9 +86,18 @@ const prepareFileRead = async (
   return { status: "ready", before };
 };
 
-const readFileContents = async (request: {
-  readonly handle: FileHandle;
+/** Read a stable-size file through its borrowed descriptor; growth is a change. */
+export const readFileContents = async (request: {
+  readonly handle: {
+    read(
+      buffer: Buffer,
+      offset: number,
+      length: number,
+      position: null,
+    ): Promise<{ readonly bytesRead: number }>;
+  };
   readonly path: string;
+  readonly expectedSize: bigint;
   readonly signal?: AbortSignal;
 }): Promise<FileContentsRead> => {
   const { handle, path, signal } = request;
@@ -92,7 +115,13 @@ const readFileContents = async (request: {
           total,
         ),
       };
-    const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+    // One extra byte detects growth without allocating a full chunk at EOF.
+    const remaining = request.expectedSize - BigInt(total);
+    const chunkBytes =
+      remaining >= BigInt(READ_CHUNK_BYTES)
+        ? READ_CHUNK_BYTES
+        : Number(remaining) + 1;
+    const chunk = Buffer.allocUnsafe(chunkBytes);
     const read = await handle.read(chunk, 0, chunk.byteLength, null);
     if (isAborted(signal))
       return {
@@ -107,6 +136,17 @@ const readFileContents = async (request: {
       };
     if (read.bytesRead === 0) break;
     total += read.bytesRead;
+    if (BigInt(total) > request.expectedSize)
+      return {
+        status: "failed",
+        entry: entryFailure(
+          path,
+          "file",
+          "changed",
+          "File grew while it was read",
+          total,
+        ),
+      };
     chunks.push(chunk.subarray(0, read.bytesRead));
   }
   return { status: "ok", chunks, total };
@@ -131,8 +171,18 @@ const finalizeFileRead = async (
     root,
     rootIdentity,
     dirname(absolute),
+    request.signal,
   );
-  if (!parentAfter.ok || !sameFile(parentBefore.stats, parentAfter.stats))
+  if (!parentAfter.ok)
+    return entryFailure(
+      path,
+      "file",
+      parentAfter.code,
+      parentAfter.message,
+      total,
+      parentAfter.localDiagnostic,
+    );
+  if (!sameFile(parentBefore.stats, parentAfter.stats))
     return entryFailure(
       path,
       "file",
@@ -159,14 +209,45 @@ const finalizeFileRead = async (
 
 export const readStableFile = async (
   request: StableFileRequest,
+): Promise<{
+  readonly entry: ReferenceSourceEntry;
+  readonly cleanup?: AnalysisCleanupObservation;
+}> => {
+  let owner: OwnedFileHandle | undefined;
+  let cleanup: AnalysisCleanupObservation | undefined;
+  let entry: ReferenceSourceEntry;
+  try {
+    entry = await readStableFileEntry(request, (admitted) => {
+      owner = admitted;
+    });
+  } finally {
+    if (owner !== undefined) {
+      const result = await request.resources.release({
+        kind: "file-handle",
+        handle: owner,
+        resource: request.absolute,
+      });
+      if (result.kind === "failed")
+        cleanup = ArtifactReaderFailure.cleanupObservation(
+          result.cause,
+          request.absolute,
+        );
+    }
+  }
+  return { entry, ...(cleanup === undefined ? {} : { cleanup }) };
+};
+
+const readStableFileEntry = async (
+  request: StableFileRequest,
+  retain: (owner: OwnedFileHandle) => void,
 ): Promise<ReferenceSourceEntry> => {
   const { root, rootIdentity, absolute, path, expected, signal } = request;
-  let handle: FileHandle | undefined;
   try {
     const parentBefore = await validateDirectory(
       root,
       rootIdentity,
       dirname(absolute),
+      signal,
     );
     if (!parentBefore.ok)
       return entryFailure(
@@ -176,12 +257,17 @@ export const readStableFile = async (
         parentBefore.message,
         safeSize(expected.size),
       );
-    handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const { handle } = await openRegularFile(absolute, {
+      symlinks: "reject",
+      signal,
+    });
+    retain(new OwnedFileHandle(handle));
     const prepared = await prepareFileRead(request, handle);
     if (prepared.status === "failed") return prepared.entry;
     const contents = await readFileContents({
       handle,
       path,
+      expectedSize: prepared.before.size,
       ...(signal === undefined ? {} : { signal }),
     });
     if (contents.status === "failed") return contents.entry;
@@ -195,16 +281,42 @@ export const readStableFile = async (
       parentBefore,
       chunks: contents.chunks,
       total: contents.total,
+      ...(signal === undefined ? {} : { signal }),
     });
-  } catch {
+  } catch (caught: unknown) {
+    let cause = caught;
+    if (cause instanceof RegularFileAdmissionFailure) {
+      retain(cause.owner);
+      cause = cause.cause;
+    }
+    if (regularFileCancellation(cause) !== undefined)
+      return entryFailure(
+        path,
+        "file",
+        "cancelled",
+        "File read cancelled",
+        safeSize(expected.size),
+      );
+    if (cause instanceof NonRegularFileReadError)
+      return entryFailure(
+        path,
+        "file",
+        "changed",
+        "File is no longer a regular file",
+        safeSize(expected.size),
+      );
+    const detail = filesystemFailureDetail(
+      cause,
+      "File could not be read safely",
+    );
+    if (detail === undefined) throw cause;
     return entryFailure(
       path,
       "file",
-      isAborted(signal) ? "cancelled" : "io",
-      "File could not be read safely",
+      "io",
+      detail.message,
       safeSize(expected.size),
+      detail.localDiagnostic,
     );
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 };

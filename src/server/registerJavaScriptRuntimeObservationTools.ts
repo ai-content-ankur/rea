@@ -1,91 +1,58 @@
-import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { OptionalProviderLoadFailure } from "../application/OptionalObservationProviders.js";
 
-import type { BinarySessionPort } from "../application/BinarySession.js";
-import type { JavaScriptRuntimeObservationPort } from "../application/JavaScriptRuntimeObservationPort.js";
+import type { JavaScriptRuntimeObservationPort } from "../application/javascript/JavaScriptRuntimeObservationPort.js";
 import {
   listJavaScriptRuntimeTargets,
   observeJavaScriptRuntime,
-} from "../application/JavaScriptRuntimeObservationService.js";
-import type { PermissionAuthority } from "../application/PermissionAuthority.js";
-import { JAVASCRIPT_RUNTIME_OBSERVATION_TOOL_CONTRACTS } from "../contracts/javascriptRuntimeObservationToolContracts.js";
-import type { ToolContract } from "../contracts/toolContracts.js";
-import type { AnalysisError } from "../domain/errors.js";
-import type { Evidence } from "../domain/evidence.js";
-import type { Result } from "../domain/result.js";
-import { observeJavaScriptRuntimeInputSchema } from "../domain/javascriptRuntimeObservation.js";
-import type { Logger } from "../logger.js";
-import { logToolExecution } from "./toolLogging.js";
+} from "../application/javascript/JavaScriptRuntimeObservationService.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import type { Logger } from "pino";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import { runEvidenceToolOperation } from "./contractToolHandler.js";
 
 interface RuntimeToolRegistration {
   readonly logger: Logger;
+  readonly loadFailure?: OptionalProviderLoadFailure | undefined;
   readonly runtime: JavaScriptRuntimeObservationPort | undefined;
-  readonly permissionAuthority: PermissionAuthority | undefined;
-  readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
+  readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+  readonly withAdmittedAnalysis?: WithAdmittedAnalysis;
 }
 
 /** Register passive Inspector tools even when policy keeps them unavailable. */
 export const registerJavaScriptRuntimeObservationTools = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   options: RuntimeToolRegistration,
 ): void => {
-  const [listContract, observeContract] =
-    JAVASCRIPT_RUNTIME_OBSERVATION_TOOL_CONTRACTS;
+  const registration = { ...options, server };
+  const listContract = toolContract("list_javascript_runtime_targets");
+  const observeContract = toolContract("observe_javascript_runtime");
   server.registerTool(
     listContract.name,
     toolRegistrationOptions(listContract),
     (input, context) =>
-      runRuntimeTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         listContract,
+        options.loadFailure,
         { input, context },
-        (parsed, signal) =>
-          listJavaScriptRuntimeTargets(
-            options.runtime,
-            options.permissionAuthority,
-            parsed,
-            { signal },
-          ),
+        (parsed, { signal }) =>
+          listJavaScriptRuntimeTargets(options.runtime, parsed, { signal }),
       ),
   );
   server.registerTool(
     observeContract.name,
     toolRegistrationOptions(observeContract),
     (input, context) =>
-      runRuntimeTool(
-        options,
+      runEvidenceToolOperation(
+        registration,
         observeContract,
+        options.loadFailure,
         { input, context },
-        async (parsed, signal) => {
-          const request = observeJavaScriptRuntimeInputSchema.parse(parsed);
-          return observeJavaScriptRuntime(
-            options.runtime,
-            options.permissionAuthority,
-            request,
-            { signal },
-          );
-        },
+        (parsed, { signal }) =>
+          observeJavaScriptRuntime(options.runtime, parsed, { signal }),
       ),
   );
-};
-
-const runRuntimeTool = async <Input>(
-  options: RuntimeToolRegistration,
-  contract: ToolContract,
-  request: { readonly input: Input; readonly context: ServerContext },
-  execute: (
-    input: Input,
-    signal: AbortSignal,
-  ) => Promise<Result<Evidence, AnalysisError>>,
-) => {
-  const { input, context } = request;
-  const result = await logToolExecution(options.logger, contract.name, () =>
-    execute(input, context.mcpReq.signal),
-  );
-  if (!result.ok) return toCallToolResult(result, contract);
-  const recorded = options.recordEvidence?.(result.value);
-  return recorded !== undefined && !recorded.ok
-    ? toCallToolResult(recorded, contract)
-    : toCallToolResult({ ok: true, value: result.value }, contract);
 };

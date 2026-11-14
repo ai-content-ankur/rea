@@ -1,47 +1,67 @@
-import type { McpServer } from "@modelcontextprotocol/server";
-
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { EvidenceMcpServer } from "./EvidenceMcpServer.js";
+import type { EvidenceWriter } from "../application/investigation/InvestigationRecordPort.js";
+import type { EvidenceLookup } from "../application/EvidenceInputResolver.js";
+import {
+  optionalProviderUnavailable,
+  type OptionalProviderLoadFailure,
+} from "../application/OptionalObservationProviders.js";
+import { err } from "../domain/result.js";
+import { browserScenarioSchema } from "../domain/browserScenario.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import type { BrowserScenarioCapturePort } from "../application/BrowserScenarioCapturePort.js";
 import { captureBrowserScenario } from "../application/BrowserScenarioCaptureService.js";
-import type { PermissionAuthority } from "../application/PermissionAuthority.js";
-import { BROWSER_SCENARIO_TOOL_CONTRACTS } from "../contracts/browserScenarioToolContracts.js";
-import { browserScenarioSchema } from "../domain/browserScenario.js";
-import type { Logger } from "../logger.js";
-import { logToolExecution } from "./toolLogging.js";
+import { toolContract } from "../contracts/toolContracts.js";
+import type { Logger } from "pino";
 import { toolRegistrationOptions } from "./toolRegistrationOptions.js";
-import { toCallToolResult } from "./toolResult.js";
+import type { WithAdmittedAnalysis } from "./analysisAdmission.js";
+import { createRetainedSummaryToolHandler } from "./contractToolHandler.js";
 
 interface BrowserScenarioToolRegistration {
   readonly logger: Logger;
+  readonly loadFailure?: OptionalProviderLoadFailure | undefined;
   readonly provider: BrowserScenarioCapturePort | undefined;
-  readonly permissionAuthority: PermissionAuthority | undefined;
-  readonly recordEvidence: BinarySessionPort["recordEvidence"] | undefined;
+  readonly recordEvidence: EvidenceWriter["recordEvidence"] | undefined;
+  readonly evidenceById?: EvidenceLookup | undefined;
+  readonly withAdmittedAnalysis?: WithAdmittedAnalysis;
 }
 
-/** Register the controlled browser scenario tool even when policy disables it. */
+/** Validate one scenario, then share complete/retained delivery with other analyses. */
 export const registerBrowserScenarioTool = (
-  server: McpServer,
+  server: EvidenceMcpServer,
   options: BrowserScenarioToolRegistration,
 ): void => {
-  const [contract] = BROWSER_SCENARIO_TOOL_CONTRACTS;
+  const contract = toolContract("capture_browser_scenario");
+  const handler = createRetainedSummaryToolHandler(
+    server,
+    contract,
+    async (input, execution) => {
+      // The SDK admits the advertised structure. The canonical semantic parser
+      // owns field-path diagnostics, shared with the CLI rather than flattened
+      // into the SDK's pre-handler validation message.
+      const scenario = browserScenarioSchema.safeParse(input);
+      if (!scenario.success)
+        return err(
+          analysisInputErrorFromIssues(
+            contract.name,
+            scenario.error.issues,
+            input,
+            { cause: scenario.error },
+          ),
+        );
+      return options.loadFailure === undefined
+        ? captureBrowserScenario(options.provider, scenario.data, execution)
+        : err(optionalProviderUnavailable(options.loadFailure, contract.name));
+    },
+    options.logger,
+    {
+      recordEvidence: options.recordEvidence,
+      evidenceById: options.evidenceById,
+    },
+    options.withAdmittedAnalysis,
+  );
   server.registerTool(
     contract.name,
     toolRegistrationOptions(contract),
-    async (input, context) => {
-      const scenario = browserScenarioSchema.parse(input);
-      const result = await logToolExecution(options.logger, contract.name, () =>
-        captureBrowserScenario(
-          options.provider,
-          options.permissionAuthority,
-          scenario,
-          { signal: context.mcpReq.signal },
-        ),
-      );
-      if (!result.ok) return toCallToolResult(result, contract);
-      const recorded = options.recordEvidence?.(result.value);
-      return recorded !== undefined && !recorded.ok
-        ? toCallToolResult(recorded, contract)
-        : toCallToolResult({ ok: true, value: result.value }, contract);
-    },
+    handler,
   );
 };

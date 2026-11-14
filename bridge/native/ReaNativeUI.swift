@@ -18,33 +18,41 @@ struct Request: Decodable {
 struct Action: Decodable { var kind: String; var path: [Int]?; var direction: String?; var text: String? }
 struct BoundaryFailure: Error { var code: String; var message: String }
 func fail(_ code: String, _ message: String) throws -> Never { throw BoundaryFailure(code: code, message: message) }
-func attribute(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+func attribute(_ element: AXUIElement, _ key: String) -> (value: CFTypeRef?, error: Int32?) {
   var value: CFTypeRef?
-  return AXUIElementCopyAttributeValue(element, key as CFString, &value) == .success ? value : nil
+  let status = AXUIElementCopyAttributeValue(element, key as CFString, &value)
+  return captureAttributeValue(status: status.rawValue, success: AXError.success.rawValue, absent: [AXError.noValue.rawValue, AXError.attributeUnsupported.rawValue], value: value)
 }
-func childCount(_ element: AXUIElement) -> Int {
+func childCount(_ element: AXUIElement) -> ChildCount {
   var count = 0
-  return AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute as CFString, &count) == .success ? count : 0
+  let status = AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute as CFString, &count)
+  return captureChildCount(status: status.rawValue, success: AXError.success.rawValue, value: count)
 }
-func children(_ element: AXUIElement, limit: Int = 2000) -> [AXUIElement] {
-  var value: CFArray?
-  let count = min(limit, childCount(element))
-  if count == 0 { return [] }
-  return AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, count, &value) == .success ? value as? [AXUIElement] ?? [] : []
+func children(_ element: AXUIElement, count: Int) -> ChildBatch<AXUIElement> {
+  captureChildValues(requestedCount: count) {
+    var value: CFArray?
+    guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, count, &value) == .success else { return nil }
+    return value as? [AXUIElement]
+  }
 }
-func text(_ element: AXUIElement, _ key: String) -> Any { (attribute(element, key) as? String).map { String($0.prefix(4096)) } ?? NSNull() as Any }
-func windowBounds(_ element: AXUIElement) -> CGRect? {
-  guard let p = attribute(element, kAXPositionAttribute), let s = attribute(element, kAXSizeAttribute),
-    CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return nil }
-  var point = CGPoint.zero; var size = CGSize.zero
-  guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &size) else { return nil }
-  return CGRect(origin: point, size: size)
+func windowBounds(_ element: AXUIElement) -> (bounds: CGRect?, error: Int32?) {
+  let position = attribute(element, kAXPositionAttribute)
+  let size = attribute(element, kAXSizeAttribute)
+  if let error = position.error ?? size.error { return (nil, error) }
+  guard let p = position.value, let s = size.value,
+    CFGetTypeID(p) == AXValueGetTypeID(), CFGetTypeID(s) == AXValueGetTypeID() else { return (nil, nil) }
+  var point = CGPoint.zero; var dimensions = CGSize.zero
+  guard AXValueGetValue(p as! AXValue, .cgPoint, &point), AXValueGetValue(s as! AXValue, .cgSize, &dimensions) else { return (nil, nil) }
+  return (CGRect(origin: point, size: dimensions), nil)
 }
 func observe(_ request: Request) async throws -> [String: Any] {
-  guard let app = NSRunningApplication(processIdentifier: request.pid), let url = app.executableURL else {
-    try fail("target-mismatch", "Selected PID does not expose an application executable URL")
+  guard let app = NSRunningApplication(processIdentifier: request.pid) else {
+    try fail("pid-not-application", "LaunchServices does not expose an application for the selected PID; this does not establish that the process is absent")
   }
-  guard let canonicalPointer = realpath(url.path, nil) else { try fail("target-mismatch", "Running executable path cannot be resolved") }
+  guard let url = app.executableURL else {
+    try fail("application-executable-unavailable", "The selected application does not expose an executable URL; select a PID with an identifiable application executable")
+  }
+  guard let canonicalPointer = realpath(url.path, nil) else { try fail("executable-path-unavailable", "Running executable path cannot be resolved") }
   defer { free(canonicalPointer) }
   let canonicalExecutable = String(cString: canonicalPointer)
   guard canonicalExecutable == request.executable else {
@@ -60,7 +68,10 @@ func observe(_ request: Request) async throws -> [String: Any] {
   guard SHA256.hash(data: executableBytes).map({ String(format: "%02x", $0) }).joined() == request.sha256 else {
     try fail("target-mismatch", "Running executable bytes differ from the active target digest")
   }
-  guard let windows = CGWindowListCopyWindowInfo([.optionIncludingWindow], request.window_id) as? [[String: Any]],
+  // .optionIncludingWindow omits a selected window while it is off screen, which
+  // is not absence: select from every window, and let capture report what it can.
+  guard let windows = (CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]])?
+    .filter({ ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == request.window_id }),
     windows.count == 1, let window = windows.first,
     (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == request.pid,
     (window[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
@@ -76,24 +87,42 @@ func observe(_ request: Request) async throws -> [String: Any] {
     guard AXIsProcessTrusted() else { try fail("accessibility-denied", "Grant Accessibility to the REA host in System Settings > Privacy & Security, then retry") }
     let application = AXUIElementCreateApplication(request.pid)
     AXUIElementSetMessagingTimeout(application, 2)
-    guard let axWindows = attribute(application, kAXWindowsAttribute) as? [AXUIElement] else {
-      try fail("accessibility-unavailable", "Selected application does not expose accessibility windows")
+    let windowsAttribute = attribute(application, kAXWindowsAttribute)
+    if let error = windowsAttribute.error {
+      try fail("accessibility-unavailable", "Cannot read accessibility windows: AXError \(error)")
     }
-    let matches = axWindows.filter { windowBounds($0) == bounds }
-    guard matches.count == 1 else { try fail("ambiguous-window", "Accessibility window geometry does not identify exactly one selected window; selected CG bounds \(bounds), AX candidates \(axWindows.map { String(describing: windowBounds($0)) })") }
+    guard let axWindows = windowsAttribute.value as? [AXUIElement] else {
+      try fail("accessibility-unavailable", "Accessibility windows are unavailable for the selected application")
+    }
+    let candidates = axWindows.map { (element: $0, observation: windowBounds($0)) }
+    if let error = candidates.compactMap({ $0.observation.error }).first {
+      try fail("accessibility-unavailable", "Cannot read accessibility window geometry: AXError \(error)")
+    }
+    guard candidates.allSatisfy({ $0.observation.bounds != nil }) else {
+      try fail("accessibility-unavailable", "Accessibility window geometry is unavailable; the selected window cannot be identified")
+    }
+    let matches = candidates.filter { $0.observation.bounds == bounds }.map { $0.element }
+    guard matches.count == 1 else { try fail("ambiguous-window", "Accessibility window geometry does not identify exactly one selected window; selected CG bounds \(bounds), AX candidates \(candidates.map { String(describing: $0.observation.bounds) })") }
     selected = matches[0]
   }
   if let action = request.action, let root = selected {
     var element = root
     for index in action.path ?? [] {
       var selectedChild: CFArray?
-      guard index >= 0 && index < childCount(element),
-        AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, index, 1, &selectedChild) == .success,
-        let item = (selectedChild as? [AXUIElement])?.first else { try fail("element-missing", "Selected accessibility path no longer exists") }
+      let count = childCount(element)
+      guard let available = count.value else {
+        try fail("element-count-unavailable", "Cannot validate selected accessibility path because child count failed with AXError \(count.error ?? -1)")
+      }
+      guard index >= 0 && index < available else { try fail("element-missing", "Selected accessibility path no longer exists") }
+      let childStatus = AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, index, 1, &selectedChild)
+      guard childStatus == .success else { try fail("accessibility-unavailable", "Cannot read selected accessibility child: AXError \(childStatus.rawValue)") }
+      guard let item = (selectedChild as? [AXUIElement])?.first else { try fail("accessibility-unavailable", "Selected accessibility child was not returned") }
       element = item
     }
     var owner: pid_t = 0
-    guard AXUIElementGetPid(element, &owner) == .success && owner == request.pid else { try fail("element-owner-mismatch", "Selected element belongs to another process") }
+    let ownerStatus = AXUIElementGetPid(element, &owner)
+    guard ownerStatus == .success else { try fail("accessibility-unavailable", "Cannot identify accessibility element owner: AXError \(ownerStatus.rawValue)") }
+    guard owner == request.pid else { try fail("element-owner-mismatch", "Selected element belongs to another process") }
     let outcome: AXError
     switch action.kind {
     case "click": outcome = AXUIElementPerformAction(element, kAXPressAction as CFString)
@@ -103,20 +132,39 @@ func observe(_ request: Request) async throws -> [String: Any] {
     }
     guard outcome == .success else { try fail("action-failed", "Accessibility action failed with AXError \(outcome.rawValue)") }
   }
-  var nodes: [[String: Any]] = []; var truncated = false
+  var nodes: [[String: Any]] = []; var truncated = false; var gaps: [String] = []
   if request.accessibility, let root = selected {
     var pending: [(AXUIElement, [Int])] = [(root, [])]
     while let (element, path) = pending.popLast() {
       if nodes.count >= request.max_nodes { truncated = true; break }
-      let items = children(element)
+      let childCountResult = childCount(element)
       var actions: CFArray?
-      AXUIElementCopyActionNames(element, &actions)
-      nodes.append(["path": path, "role": text(element, kAXRoleAttribute), "title": text(element, kAXTitleAttribute), "value": text(element, kAXValueAttribute), "actions": actions as? [String] ?? [], "children_count": childCount(element)])
-      if path.count >= 32 { if !items.isEmpty { truncated = true }; continue }
+      let actionStatus = AXUIElementCopyActionNames(element, &actions)
+      let observedActions = captureActionNames(status: actionStatus.rawValue, success: AXError.success.rawValue, names: actions as? [String])
+      if let error = observedActions.error { gaps.append("AX actions unavailable at path \(path): AXError \(error)"); truncated = true }
+      let role = attribute(element, kAXRoleAttribute)
+      let title = attribute(element, kAXTitleAttribute)
+      let value = attribute(element, kAXValueAttribute)
+      for (name, error) in [("role", role.error), ("title", title.error), ("value", value.error)] {
+        if let error { gaps.append("AX \(name) unavailable at path \(path): AXError \(error)"); truncated = true }
+      }
+      let observedValue = captureAccessibilityValue(value.value)
+      if let gap = observedValue.gap { gaps.append("\(gap) at path \(path)"); truncated = true }
+      nodes.append(["path": path, "role": (role.value as? String) ?? NSNull() as Any, "title": (title.value as? String) ?? NSNull() as Any, "value": observedValue.value, "actions": observedActions.names, "children_count": childCountResult.value.map { $0 as Any } ?? NSNull()])
+      guard let totalChildren = childCountResult.value else {
+        truncated = true
+        gaps.append("AX child count unavailable at path \(path): AXError \(childCountResult.error ?? -1)")
+        continue
+      }
+      if path.count >= 32 { if totalChildren > 0 { truncated = true }; continue }
       let available = max(0, request.max_nodes - nodes.count - pending.count)
-      let count = min(available, items.count)
-      if childCount(element) > count { truncated = true }
-      for index in (0..<count).reversed() { pending.append((items[index], path + [index])) }
+      let count = min(available, totalChildren)
+      let batch = children(element, count: count)
+      if !batch.complete { truncated = true }
+      if totalChildren > count { truncated = true }
+      for (index, item) in batch.values.enumerated().reversed() {
+        pending.append((item, path + [index]))
+      }
     }
   }
   var screenshot: Any = NSNull()
@@ -133,23 +181,23 @@ func observe(_ request: Request) async throws -> [String: Any] {
     configuration.width = max(1, Int(bounds.width * scale)); configuration.height = max(1, Int(bounds.height * scale))
     configuration.showsCursor = false
     let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]), png.count <= 8 * 1024 * 1024 else {
-      try fail("image-limit", "Selected-window PNG exceeded 8 MiB")
+    guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+      try fail("capture-failed", "Selected-window PNG encoding failed")
     }
     screenshot = ["mime_type": "image/png", "base64": png.base64EncodedString(), "sha256": SHA256.hash(data: png).map({ String(format: "%02x", $0) }).joined(), "width": image.width, "height": image.height]
   }
-  return ["window": ["pid": request.pid, "window_id": request.window_id, "executable": request.executable, "launch_time": launch, "title": window[kCGWindowName as String] as? String ?? ""], "nodes": nodes, "truncated": truncated, "screenshot": screenshot, "gaps": request.accessibility ? [] : ["Accessibility capture was disabled"]]
+  return ["window": ["pid": request.pid, "window_id": request.window_id, "executable": request.executable, "launch_time": launch, "title": window[kCGWindowName as String] as? String ?? ""], "nodes": nodes, "truncated": truncated, "screenshot": screenshot, "gaps": request.accessibility ? gaps : ["Accessibility capture was disabled"]]
 }
 Task { @MainActor in
   do {
     let request = try JSONDecoder().decode(Request.self, from: Data(CommandLine.arguments[1].utf8))
     let result = try await observe(request)
-    let output = try JSONSerialization.data(withJSONObject: ["ok": true, "result": result], options: [.sortedKeys])
+    let output = try serializeHelperOutput(["ok": true, "result": result])
     FileHandle.standardOutput.write(output)
   } catch {
     let failure = error as? BoundaryFailure
     let output: [String: Any] = ["ok": false, "code": failure?.code ?? "capture-failed", "message": failure?.message ?? error.localizedDescription]
-    if let data = try? JSONSerialization.data(withJSONObject: output, options: [.sortedKeys]) { FileHandle.standardOutput.write(data) }
+    if let data = try? serializeHelperOutput(output) { FileHandle.standardOutput.write(data) }
   }
   exit(0)
 }

@@ -1,5 +1,7 @@
 import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { supportedClients } from "../dist/application/SupportedClients.js";
 
 /** Create an isolated prefix, fake PATH, client configs, and environment. */
 export async function verifyPackageEnvironment({
@@ -39,7 +41,7 @@ export async function verifyPackageEnvironment({
   await writeFile(swVers, "#!/bin/sh\necho 14.5\n");
   await writeFile(
     npx,
-    '#!/bin/sh\nprintf "%s\\n" "$*" > "$REA_NPX_LOG"\necho "│ ✓ Cursor: isolated │"\n',
+    '#!/bin/sh\nexec "$REA_VERIFY_NODE" "$REA_VERIFY_NPX_SCRIPT" "$@"\n',
   );
   await writeFile(hopper, "#!/bin/sh\nexit 0\n");
   await Promise.all([
@@ -48,7 +50,11 @@ export async function verifyPackageEnvironment({
     chmod(hopper, 0o755),
     chmod(npx, 0o755),
   ]);
-  const claudeDir = join(home, "Library/Application Support/Claude");
+  const claudeDir = supportedClients(home, process.platform, {}).find(
+    ({ name }) => name === "claude_desktop",
+  )?.markerPath;
+  if (claudeDir === undefined)
+    throw new Error("Claude Desktop fixture has no configuration directory");
   const codexDir = join(home, ".codex");
   const cursorDir = join(home, ".cursor");
   await Promise.all([
@@ -69,11 +75,33 @@ export async function verifyPackageEnvironment({
   const environment = {
     ...process.env,
     HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: join(home, "AppData", "Local"),
+    CLAUDE_CONFIG_DIR: home,
+    CODEX_HOME: codexDir,
+    COPILOT_HOME: join(home, ".copilot"),
+    GROK_HOME: join(home, ".grok"),
+    SAND_DATA_ROOT: join(home, ".grokbot"),
+    OMP_PROFILE: undefined,
+    PI_CODING_AGENT_DIR: undefined,
+    PI_CONFIG_DIR: undefined,
+    PI_PROFILE: undefined,
+    QWEN_HOME: undefined,
+    OPENCODE_CONFIG: undefined,
+    OPENCODE_CONFIG_DIR: undefined,
+    GEMINI_CLI_HOME: undefined,
+    GEMINI_CLI_SYSTEM_SETTINGS_PATH: undefined,
+    GEMINI_CLI_SYSTEM_DEFAULTS_PATH: undefined,
     XDG_CONFIG_HOME: join(home, ".config"),
     PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
     REA_ANALYSIS_PROVIDER: "auto",
     ...packageHopperEnvironment(root),
     REA_NPX_LOG: npxLog,
+    REA_VERIFY_NODE: process.execPath,
+    REA_VERIFY_NPX_SCRIPT: fileURLToPath(
+      new URL("./lib/verify-package-runner-fixture.mjs", import.meta.url),
+    ),
     REA_REFERENCE_SECRET_PATTERNS_JSON: JSON.stringify([".env"]),
   };
   return {
@@ -89,7 +117,7 @@ export async function verifyPackageEnvironment({
   };
 }
 
-export const packageHopperEnvironment = (root, platform = process.platform) => {
+const packageHopperEnvironment = (root, platform = process.platform) => {
   const fakeLauncher = join(root, "tests/fixtures/fakeLauncher.mjs");
   if (platform !== "linux")
     return {
@@ -98,6 +126,14 @@ export const packageHopperEnvironment = (root, platform = process.platform) => {
     };
   return {
     HOPPER_LAUNCHER_PATH: "/bin/sh",
+    // Feed availability must not turn this foreign-launcher rejection test into
+    // an unrelated networking failure. Successful vendor verification is real E2E coverage.
+    NODE_OPTIONS: [
+      process.env.NODE_OPTIONS,
+      `--import=${pathToFileURL(join(root, "tests/fixtures/hopperRejectionFeed.mjs")).href}`,
+    ]
+      .filter(Boolean)
+      .join(" "),
     HOPPER_LOADER_ARGS_JSON: JSON.stringify([
       "-c",
       'node_path=$1; shift; "$node_path" "$@"',

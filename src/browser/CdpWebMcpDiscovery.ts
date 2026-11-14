@@ -1,3 +1,8 @@
+import {
+  cdpFrameRecordFacts,
+  cdpFrameEventFacts,
+  type CdpFrameFacts,
+} from "./CdpFrameIdentity.js";
 import { createHash } from "node:crypto";
 
 import type { ProgressReporter } from "../application/ProgressReporter.js";
@@ -5,23 +10,37 @@ import type {
   DiscoverWebMcpToolsInput,
   WebMcpDiscovery,
 } from "../domain/webMcpDiscovery.js";
-import { inferJsonShape } from "../domain/jsonShape.js";
+import { jsonValueSchema } from "../domain/jsonValue.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../domain/unicodeCodePointOrder.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import type { CdpConnection, CdpEvent } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
-import { BrowserObservationError } from "../domain/errors.js";
+import { BrowserObservationError } from "../domain/browserObservationError.js";
+import { cdpOriginScopeRefusal } from "./CdpOriginScopeError.js";
 import {
   allowedSanitizedUrl,
   delayWithCancellation,
   numberValue,
   recordValue,
-  recordsValue,
-  stringValue,
+  cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
-import { captureFrames, mainFrameUrl } from "./CdpCaptureDocuments.js";
+import {
+  classifyCdpFrameUrl,
+  observeCdpFrameUrl,
+  mainFrameUrl,
+  observeMainFrameUrl,
+  walkFrameTrees,
+} from "./CdpCaptureDocuments.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
-import { redactSensitiveText } from "./SensitiveTextCapture.js";
+import {
+  cdpSourceCoordinates,
+  topCallFrame,
+} from "./CdpCaptureEventHelpers.js";
 
 interface DiscoveryContext {
   readonly connection: CdpConnection;
@@ -55,27 +74,34 @@ export const discoverWebMcp = async (
     context.sessionId,
     context.signal,
   );
-  const initialUrl = mainFrameUrl(frameTree);
-  if (allowedSanitizedUrl(initialUrl, origins) === undefined)
-    throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-  const frames = captureFrames(
-    frameTree,
-    origins,
-    undefined,
-    completeness,
-  ).items;
-  const frameUrls = new Map(
-    frames.map((frame) => [
-      frame.frame_id,
-      {
-        url: frame.url,
-        origin: frame.origin,
-        parentFrameId: frame.parent_frame_id,
-      },
-    ]),
-  );
+  const initialFrame = requiredDiscoveryFrame(frameTree, origins);
+  if (initialFrame.loaderId === undefined || initialFrame.loaderId === "") {
+    completeness.attachLimited("webmcp_tools");
+    limitations.push(
+      "The initial document loader identity was unavailable, so document stability could not be verified. Retry after the page finishes loading.",
+    );
+  }
+  const frameUrls = new Map<string, FrameScopeFrame>();
   const tools = new Map<string, WebMcpDiscovery["tools"]["items"][number]>();
-  const frameScope = { origins, frames: frameUrls, tools, completeness };
+  const frameScope = {
+    origins,
+    frames: frameUrls,
+    tools,
+    completeness,
+    transientFrames: new Set<string>(),
+    resolvedTransientFrames: new Set<string>(),
+  };
+  ingestInitialFrameTree(frameTree, frameScope);
+  if (
+    [...frameUrls.values()].some(
+      (frame) => frame.parentFrameId !== null && frame.origin !== null,
+    )
+  ) {
+    completeness.attachLimited("webmcp_tools");
+    limitations.push(
+      "WebMCP.enable replay does not establish coverage of pre-existing subframe registrations. Later live registrations are retained, but cannot recover descriptors omitted before attachment.",
+    );
+  }
   const removeListener = context.connection.onEvent((event) => {
     if (event.sessionId !== context.sessionId) return;
     if (ingestFrameScopeEvent(event, frameScope)) return;
@@ -85,15 +111,18 @@ export const discoverWebMcp = async (
       frames: frameUrls,
       tools,
       completeness,
+      transientFrames: frameScope.transientFrames,
+      resolvedTransientFrames: frameScope.resolvedTransientFrames,
     });
   });
-  await context.progress?.report({
-    phase: "browser_observation",
-    completed: 1,
-    total: 2,
-    message: "Enabling passive WebMCP discovery",
-  });
+  let result: ReturnType<typeof buildWebMcpResult>;
   try {
+    await context.progress?.report({
+      phase: "browser_observation",
+      completed: 1,
+      total: 2,
+      message: "Enabling passive WebMCP discovery",
+    });
     const enabled = await optionalCdpCommand(
       context,
       "WebMCP.enable",
@@ -110,8 +139,10 @@ export const discoverWebMcp = async (
         "discover_webmcp_tools",
         context.signal,
       );
-    await assertStableAuthorizedFrame(context, initialUrl, origins);
-    return buildWebMcpResult({
+    await assertStableAuthorizedFrame(context, initialFrame, origins);
+    if (frameScope.transientFrames.size > 0)
+      completeness.attachLimited("webmcp_tools");
+    result = buildWebMcpResult({
       context,
       frameTree,
       tools,
@@ -121,14 +152,15 @@ export const discoverWebMcp = async (
     });
   } finally {
     removeListener();
-    await context.progress?.report({
-      phase: "browser_observation",
-      completed: 2,
-      total: 2,
-      message: "WebMCP discovery complete",
-      terminal: true,
-    });
   }
+  await context.progress?.report({
+    phase: "browser_observation",
+    completed: 2,
+    total: 2,
+    message: "WebMCP discovery complete",
+    terminal: true,
+  });
+  return result;
 };
 
 interface FrameScopeState {
@@ -136,70 +168,190 @@ interface FrameScopeState {
   readonly frames: Map<string, FrameScopeFrame>;
   readonly tools: Map<string, WebMcpDiscovery["tools"]["items"][number]>;
   readonly completeness: CdpCaptureCompleteness;
+  readonly transientFrames: Set<string>;
+  readonly resolvedTransientFrames: Set<string>;
 }
 
 interface FrameScopeFrame {
   readonly url: string;
   readonly origin: string | null;
   readonly parentFrameId: string | null;
+  readonly loaderId?: string | undefined;
 }
+
+const ingestInitialFrameTree = (
+  frameTree: unknown,
+  state: FrameScopeState,
+): void => {
+  const root = recordValue(recordValue(frameTree)?.frameTree);
+  if (root === undefined) {
+    state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return;
+  }
+  for (const tree of walkFrameTrees(root, (omittedCount) =>
+    state.completeness.exclude(
+      "webmcp_tools",
+      "invalid_protocol_value",
+      omittedCount,
+    ),
+  )) {
+    const facts = cdpFrameRecordFacts(recordValue(tree.frame));
+    if (tree !== root && facts.parentRelation === "root") {
+      invalidateFrameFacts(facts, state);
+      continue;
+    }
+    handleFrameUpdate(facts, state, true);
+  }
+};
 
 const ingestFrameScopeEvent = (
   event: CdpEvent,
   state: FrameScopeState,
 ): boolean => {
-  const params = recordValue(event.params);
-  if (params === undefined) return false;
-  switch (event.method) {
-    case "Page.frameDetached":
-      return handleFrameDetached(params, state);
-    case "Page.frameNavigated":
-      return handleFrameUpdate(recordValue(params.frame), state);
-    case "Page.navigatedWithinDocument":
-      return handleFrameUpdate(params, state);
+  const facts = cdpFrameEventFacts(event);
+  switch (facts.kind) {
+    case "detached":
+      if (facts.identityIssue !== null || facts.frameId === null) {
+        invalidateFrameFacts(facts, state);
+        return true;
+      }
+      removeFrame(facts.frameId, state.frames, state.tools);
+      state.transientFrames.delete(facts.frameId);
+      state.resolvedTransientFrames.delete(facts.frameId);
+      return true;
+    case "navigated":
+      return handleFrameUpdate(facts, state, true);
+    case "within_document":
+      return handleFrameUpdate(facts, state, false);
     default:
       return false;
   }
 };
 
-const handleFrameDetached = (
-  params: UnknownRecord,
+/** Malformed declarations cannot preserve cached authority for an attributable frame. */
+const invalidateFrameFacts = (
+  facts: CdpFrameFacts,
   state: FrameScopeState,
-): boolean => {
-  const frameId = stringValue(params.frameId);
-  if (frameId === undefined) {
-    state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
-    return true;
-  }
-  removeFrame(frameId, state.frames, state.tools);
-  return true;
+): void => {
+  state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  if (facts.frameId === null) return;
+  removeFrame(facts.frameId, state.frames, state.tools);
+  state.transientFrames.delete(facts.frameId);
+  state.resolvedTransientFrames.delete(facts.frameId);
 };
 
 const handleFrameUpdate = (
-  frame: UnknownRecord | undefined,
+  sourceFacts: CdpFrameFacts,
   state: FrameScopeState,
+  documentCommitted: boolean,
 ): boolean => {
-  const frameId = stringValue(frame?.id) ?? stringValue(frame?.frameId);
-  if (frameId === undefined) {
+  const frameId = sourceFacts.frameId;
+  if (
+    sourceFacts.identityIssue !== null ||
+    sourceFacts.parentIssue !== null ||
+    sourceFacts.loaderIssue !== null ||
+    frameId === null
+  ) {
+    invalidateFrameFacts(sourceFacts, state);
+    return true;
+  }
+  const observation = observeCdpFrameUrl(sourceFacts.source);
+  const facts = classifyCdpFrameUrl(observation, state.origins);
+  if (observation.kind !== "observed") {
+    removeFrameTools(frameId, state.tools);
+    state.frames.delete(frameId);
+    state.resolvedTransientFrames.delete(frameId);
     state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    if (facts.scope === "outside_policy") {
+      state.transientFrames.delete(frameId);
+      state.completeness.exclude("webmcp_tools", "out_of_target_scope");
+    } else state.transientFrames.add(frameId);
     return true;
   }
-  const url = allowedSanitizedUrl(frame?.url, state.origins);
-  if (url === undefined || url.origin === null) {
-    removeFrame(frameId, state.frames, state.tools);
-    state.completeness.exclude("webmcp_tools", "out_of_target_scope");
+  // Chromium can briefly commit an inherited, empty document while replacing
+  // a subframe. That intermediate URL says nothing about the frame's eventual
+  // scope or its registered tools; wait for a committed URL and fresh replay.
+  // Without those observations, discovery remains attach-limited.
+  if (isTransientFrameUrl(observation.scopeUrl)) {
+    if (documentCommitted) {
+      removeFrameTools(frameId, state.tools);
+      state.transientFrames.add(frameId);
+      state.resolvedTransientFrames.delete(frameId);
+    }
     return true;
   }
-  state.frames.set(frameId, {
-    url: url.url,
-    origin: url.origin,
-    parentFrameId:
-      (stringValue(frame?.parentId) ??
-        state.frames.get(frameId)?.parentFrameId ??
-        "") ||
-      null,
-  });
+  updateFrameScope(sourceFacts, frameId, facts, state, documentCommitted);
   return true;
+};
+
+const updateFrameScope = (
+  sourceFacts: CdpFrameFacts,
+  frameId: string,
+  facts: ReturnType<typeof classifyCdpFrameUrl>,
+  state: FrameScopeState,
+  documentCommitted: boolean,
+): void => {
+  if (facts.url === undefined || facts.origin === null) {
+    removeFrameTools(frameId, state.tools);
+    state.frames.delete(frameId);
+    state.transientFrames.delete(frameId);
+    state.resolvedTransientFrames.delete(frameId);
+    state.completeness.exclude("webmcp_tools", "out_of_target_scope");
+    return;
+  }
+  const previous = state.frames.get(frameId);
+  const loaderId = documentCommitted
+    ? sourceFacts.loaderId
+    : previous?.loaderId;
+  if (hasNewDocument(documentCommitted, previous, facts.url, loaderId))
+    removeFrameTools(frameId, state.tools);
+  if (documentCommitted && state.transientFrames.has(frameId))
+    state.resolvedTransientFrames.add(frameId);
+  state.frames.set(frameId, {
+    url: facts.url,
+    origin: facts.origin,
+    ...(loaderId === undefined ? {} : { loaderId }),
+    parentFrameId:
+      sourceFacts.parentRelation === "not_applicable"
+        ? (previous?.parentFrameId ?? null)
+        : sourceFacts.parentId,
+  });
+};
+
+const hasNewDocument = (
+  documentCommitted: boolean,
+  previous: FrameScopeFrame | undefined,
+  url: string,
+  loaderId: string | undefined,
+): boolean =>
+  documentCommitted &&
+  previous !== undefined &&
+  (previous.url !== url ||
+    (loaderId !== undefined &&
+      previous.loaderId !== undefined &&
+      previous.loaderId !== loaderId));
+
+const removeFrameTools = (
+  frameId: string,
+  tools: Map<string, WebMcpDiscovery["tools"]["items"][number]>,
+): void => {
+  for (const [key, tool] of tools)
+    if (tool.frame_id === frameId) tools.delete(key);
+};
+
+const isTransientFrameUrl = (url: string): boolean => {
+  if (url === "") return true;
+  try {
+    const base = new URL(url);
+    return (
+      base.protocol === "about:" &&
+      base.search === "" &&
+      (base.pathname === "blank" || base.pathname === "srcdoc")
+    );
+  } catch (cause: unknown) {
+    void cause;
+    return false;
+  }
 };
 
 const removeFrame = (
@@ -223,7 +375,7 @@ const removeFrame = (
 
 const assertStableAuthorizedFrame = async (
   context: DiscoveryContext,
-  initialUrl: string | undefined,
+  initial: ReturnType<typeof requiredDiscoveryFrame>,
   origins: ReadonlySet<string>,
 ): Promise<void> => {
   const finalTree = await context.connection.send(
@@ -232,11 +384,64 @@ const assertStableAuthorizedFrame = async (
     context.sessionId,
     context.signal,
   );
-  const finalUrl = mainFrameUrl(finalTree);
-  if (allowedSanitizedUrl(finalUrl, origins) === undefined)
-    throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
-  if (finalUrl !== initialUrl)
+  const final = requiredDiscoveryFrame(finalTree, origins);
+  if (
+    final.url !== initial.url ||
+    final.frameId !== initial.frameId ||
+    (initial.loaderId !== undefined &&
+      initial.loaderId !== "" &&
+      final.loaderId !== undefined &&
+      final.loaderId !== "" &&
+      final.loaderId !== initial.loaderId)
+  )
     throw new BrowserObservationError("inspect_web_page", "target_changed");
+  if (
+    initial.loaderId !== undefined &&
+    initial.loaderId !== "" &&
+    (final.loaderId === undefined || final.loaderId === "")
+  )
+    throw new BrowserObservationError(
+      "discover_webmcp_tools",
+      "protocol_error",
+      {
+        detail:
+          "CDP omitted the final document loader identity, so discovery stability could not be verified.",
+        remediationAction:
+          "Retry after the selected page has finished loading.",
+      },
+    );
+};
+
+const requiredDiscoveryFrame = (
+  result: unknown,
+  origins: ReadonlySet<string>,
+) => {
+  const observed = observeMainFrameUrl(result);
+  const facts = classifyCdpFrameUrl(observed, origins);
+  if (facts.scope === "outside_policy" || facts.scope === "unsupported")
+    throw cdpOriginScopeRefusal("discover_webmcp_tools");
+  if (observed.kind !== "observed")
+    throw new BrowserObservationError("inspect_web_page", "protocol_error");
+  if (facts.url === undefined)
+    throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
+  const frame = cdpFrameRecordFacts(
+    recordValue(recordValue(recordValue(result)?.frameTree)?.frame),
+  );
+  if (
+    frame.frameId === null ||
+    frame.identityIssue !== null ||
+    frame.parentRelation !== "root" ||
+    frame.loaderIssue !== null
+  )
+    throw new BrowserObservationError(
+      "discover_webmcp_tools",
+      "protocol_error",
+    );
+  return {
+    url: observed.url,
+    frameId: frame.frameId,
+    loaderId: frame.loaderId,
+  };
 };
 
 interface WebMcpIngestOptions {
@@ -248,28 +453,74 @@ interface WebMcpIngestOptions {
   >;
   readonly tools: Map<string, WebMcpDiscovery["tools"]["items"][number]>;
   readonly completeness: CdpCaptureCompleteness;
+  readonly transientFrames: Set<string>;
+  readonly resolvedTransientFrames: Set<string>;
 }
 
 const ingestWebMcpEvent = (options: WebMcpIngestOptions): void => {
-  const { event, input, frames, tools, completeness } = options;
+  const {
+    event,
+    input,
+    frames,
+    tools,
+    completeness,
+    transientFrames,
+    resolvedTransientFrames,
+  } = options;
+  if (
+    event.method !== "WebMCP.toolsAdded" &&
+    event.method !== "WebMCP.toolsRemoved"
+  )
+    return;
   const params = recordValue(event.params);
-  if (params === undefined) return;
+  if (params === undefined) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return;
+  }
   if (event.method === "WebMCP.toolsRemoved") {
-    for (const removed of recordsValue(params.tools)) {
-      const name = stringValue(removed.name);
-      const frameId = stringValue(removed.frameId);
-      if (name === undefined || frameId === undefined) continue;
+    for (const removed of webMcpEventTools(params.tools, completeness)) {
+      const name = cdpStringValue(removed.name);
+      const frameId = cdpStringValue(removed.frameId);
+      if (name === undefined || frameId === undefined) {
+        completeness.exclude("webmcp_tools", "invalid_protocol_value");
+        continue;
+      }
       for (const [key, tool] of tools)
         if (tool.name === name && tool.frame_id === frameId) tools.delete(key);
     }
     return;
   }
-  if (event.method !== "WebMCP.toolsAdded") return;
-  for (const declared of recordsValue(params.tools)) {
+  for (const declared of webMcpEventTools(params.tools, completeness)) {
+    const frameId = cdpStringValue(declared.frameId);
+    if (frameId !== undefined && transientFrames.has(frameId)) {
+      if (!resolvedTransientFrames.has(frameId)) continue;
+      transientFrames.delete(frameId);
+      resolvedTransientFrames.delete(frameId);
+    }
     const normalized = normalizeTool(declared, input, frames, completeness);
     if (normalized === undefined) continue;
     tools.set(normalized.tool_key, normalized);
   }
+};
+
+const webMcpEventTools = (
+  value: unknown,
+  completeness: CdpCaptureCompleteness,
+): UnknownRecord[] => {
+  if (!Array.isArray(value)) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return [];
+  }
+  const records: UnknownRecord[] = [];
+  for (const item of value) {
+    const record = recordValue(item);
+    if (record === undefined) {
+      completeness.exclude("webmcp_tools", "invalid_protocol_value");
+      continue;
+    }
+    records.push(record);
+  }
+  return records;
 };
 
 const normalizeTool = (
@@ -281,23 +532,52 @@ const normalizeTool = (
   >,
   completeness: CdpCaptureCompleteness,
 ): WebMcpDiscovery["tools"]["items"][number] | undefined => {
-  const frameId = stringValue(value.frameId);
-  const name = stringValue(value.name);
+  const frameId = cdpStringValue(value.frameId);
+  const name = cdpStringValue(value.name);
   const frame = frameId === undefined ? undefined : frames.get(frameId);
-  if (
-    frameId === undefined ||
-    name === undefined ||
-    frame?.origin === null ||
-    frame === undefined
-  ) {
+  if (frameId === undefined || name === undefined) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return undefined;
+  }
+  if (frame?.origin === null || frame === undefined) {
     completeness.exclude("webmcp_tools", "out_of_target_scope");
     return undefined;
   }
-  const description = redactSensitiveText(stringValue(value.description) ?? "");
+  const description = cdpStringValue(value.description) ?? "";
   const annotations = recordValue(value.annotations);
+  const malformedAnnotations =
+    Object.hasOwn(value, "annotations") && annotations === undefined;
+  if (malformedAnnotations)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  const annotation = (key: string): boolean | null => {
+    if (annotations === undefined || !Object.hasOwn(annotations, key))
+      return null;
+    const hint = annotations[key];
+    if (typeof hint === "boolean") return hint;
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return null;
+  };
+  const consequential = annotation("consequential");
+  const unknownConsequential =
+    malformedAnnotations ||
+    (annotations !== undefined &&
+      Object.hasOwn(annotations, "consequential") &&
+      typeof annotations.consequential !== "boolean");
+  const declaration = Object.hasOwn(value, "inputSchema")
+    ? jsonValueSchema.safeParse(value.inputSchema)
+    : undefined;
+  if (declaration?.success === false)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  const schema = declaration?.success === true ? declaration.data : null;
+  const registrationFrame = topCallFrame(value.stackTrace);
+  const coordinates = cdpSourceCoordinates(
+    registrationFrame.ok ? registrationFrame.value : undefined,
+  );
+  if (!registrationFrame.ok || coordinates.invalid)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
   return {
-    tool_key: toolKey(frame.url, name),
-    name: redactSensitiveText(name),
+    tool_key: toolKey(frame.url, frameId, name),
+    name,
     description,
     frame_id: frameId,
     frame_url: frame.url,
@@ -306,41 +586,37 @@ const normalizeTool = (
       numberValue(value.backendNodeId) === undefined
         ? "imperative"
         : "declarative",
-    input_schema_shape: schemaShape(value.inputSchema),
+    input_schema: schema,
+    input_schema_sha256:
+      declaration?.success === true ? digestCanonicalValue(schema) : null,
     annotations: {
-      read_only: booleanOrNull(annotations?.readOnly),
-      untrusted_content: booleanOrNull(annotations?.untrustedContent),
-      autosubmit: booleanOrNull(annotations?.autosubmit),
+      read_only: annotation("readOnly"),
+      untrusted_content: annotation("untrustedContent"),
+      ...(unknownConsequential ? {} : { consequential }),
+      autosubmit: annotation("autosubmit"),
     },
     registration_source: registrationSource(
-      recordValue(value.stackTrace),
+      registrationFrame.ok && !coordinates.invalid
+        ? registrationFrame.value
+        : undefined,
       new Set(input.allowed_origins),
     ),
     trust: "page-declared-untrusted",
   };
 };
 
-const schemaShape = (value: unknown) => {
-  if (recordValue(value) === undefined) return null;
-  const encoded = JSON.stringify(value);
-  const shape = inferJsonShape(encoded);
-  if (shape === null)
-    throw new BrowserObservationError("inspect_web_page", "protocol_error");
-  return shape;
-};
-
 const registrationSource = (
-  stack: UnknownRecord | undefined,
+  frame: UnknownRecord | undefined,
   allowedOrigins: ReadonlySet<string>,
 ): WebMcpDiscovery["tools"]["items"][number]["registration_source"] => {
-  const frame = recordsValue(stack?.callFrames)[0];
   const url = allowedSanitizedUrl(frame?.url, allowedOrigins);
+  const coordinates = cdpSourceCoordinates(frame);
   return frame === undefined || url === undefined
     ? null
     : {
         url: url.url,
-        line: integerOrNull(frame.lineNumber),
-        column: integerOrNull(frame.columnNumber),
+        line: coordinates.line,
+        column: coordinates.column,
       };
 };
 
@@ -375,7 +651,7 @@ const buildWebMcpResult = (options: WebMcpResultOptions): WebMcpDiscovery => {
     tools: {
       total: tools.size + completeness.droppedTotal,
       items: [...tools.values()].sort((left, right) =>
-        left.tool_key.localeCompare(right.tool_key),
+        compareUnicodeCodePoints(left.tool_key, right.tool_key),
       ),
     },
     completeness: completeness.snapshot(),
@@ -383,13 +659,10 @@ const buildWebMcpResult = (options: WebMcpResultOptions): WebMcpDiscovery => {
   };
 };
 
-const toolKey = (frameUrl: string, name: string): string =>
-  `webmcp_${createHash("sha256").update(`${frameUrl}\0${name}`).digest("hex")}`;
-
-const booleanOrNull = (value: unknown): boolean | null =>
-  typeof value === "boolean" ? value : null;
-
-const integerOrNull = (value: unknown): number | null => {
-  const number = numberValue(value);
-  return number === undefined ? null : Math.max(0, Math.trunc(number));
-};
+const toolKey = (frameUrl: string, frameId: string, name: string): string =>
+  // Registrations without a known admitted frame are excluded above, so the
+  // frame ID here always distinguishes owners. Composite tuple keeps a NUL
+  // inside one field from collapsing two registrations before hashing.
+  `webmcp_${createHash("sha256")
+    .update(compositeKey([frameUrl, frameId, name]))
+    .digest("hex")}`;

@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parseBinaryTarget } from "../dist/application/BinaryTargetResolver.js";
 import { observeNativeUi } from "../dist/native/NativeUiObservation.js";
+import { NATIVE_UI_HELPER_MAX_BUFFER } from "../dist/native/NativeUiOutputBudget.js";
+import { artifactMcpResult, withArtifactMcp } from "./lib/artifact-e2e.mjs";
+import { observeProcessStartIdentity } from "../dist/process/ProcessOwnershipObservation.js";
 
 if (process.platform !== "darwin")
   throw new Error(
@@ -13,8 +17,66 @@ if (process.platform !== "darwin")
   );
 const root = await mkdtemp(join(tmpdir(), "rea-ui-fixture-"));
 let child;
+let childExit;
 let fixturePid;
+let fixtureIdentity;
+let report;
+// `open -W` exits only after the app exits, so its own exit is the proof that
+// the fixture no longer runs from the root. Without it the root is retained.
+let retainedRoot;
+const FIXTURE_EXIT_GRACE_MS = 10_000;
 try {
+  const childRetrievalTest = join(root, "child-retrieval-test");
+  await promisify(execFile)("/usr/bin/xcrun", [
+    "swiftc",
+    fileURLToPath(
+      new URL("../bridge/native/NativeUIChildren.swift", import.meta.url),
+    ),
+    fileURLToPath(
+      new URL("../bridge/native/NativeUIValues.swift", import.meta.url),
+    ),
+    fileURLToPath(
+      new URL(
+        "../tests/conformance/native/native-ui-children/main.swift",
+        import.meta.url,
+      ),
+    ),
+    "-o",
+    childRetrievalTest,
+  ]);
+  const childRetrieval = await promisify(execFile)(childRetrievalTest, []);
+  const [slashRichProducerJson, numericProducerJson] = childRetrieval.stdout
+    .trimEnd()
+    .split("\n");
+  if (
+    slashRichProducerJson === undefined ||
+    numericProducerJson === undefined
+  ) {
+    throw new Error(
+      "Native UI serializer seam did not emit its producer bytes",
+    );
+  }
+  const slashRichConsumerJson = JSON.stringify(
+    JSON.parse(slashRichProducerJson),
+  );
+  if (slashRichProducerJson !== slashRichConsumerJson) {
+    throw new Error(
+      "Swift helper JSON bytes differ from the normalized JavaScript consumer representation",
+    );
+  }
+  const numericConsumerJson = JSON.stringify(JSON.parse(numericProducerJson));
+  if (
+    Buffer.byteLength(numericProducerJson) <=
+    Buffer.byteLength(numericConsumerJson)
+  ) {
+    throw new Error(
+      "Foundation numeric fixture no longer exercises larger producer JSON bytes",
+    );
+  }
+  if (Buffer.byteLength(numericProducerJson) > NATIVE_UI_HELPER_MAX_BUFFER) {
+    throw new Error("Foundation numeric fixture exceeds the raw helper budget");
+  }
+
   const contents = join(root, "Fixture.app", "Contents");
   await mkdir(join(contents, "MacOS"), { recursive: true });
   await writeFile(
@@ -39,6 +101,7 @@ try {
     ["-W", "-n", "-g", "--stdout", coordinates, join(root, "Fixture.app")],
     { stdio: "ignore" },
   );
+  childExit = new Promise((resolve) => child.once("exit", resolve));
   let scope;
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
@@ -54,12 +117,22 @@ try {
       "Source-owned UI fixture failed to expose one window within 20 seconds",
     );
   fixturePid = scope.pid;
+  fixtureIdentity = await observeProcessStartIdentity(fixturePid);
+  assert.equal(
+    fixtureIdentity?.state,
+    "readable",
+    "Fixture OS start identity is unavailable",
+  );
   const target = await parseBinaryTarget(executable);
   if (!target.ok) throw target.error;
-  const observation = await observeNativeUi(target.value, "observe_native_ui", {
-    ...scope,
-    observation_approved: true,
-  });
+  const observation = await observeNativeUi(
+    target.value,
+    "observe_native_ui",
+    {
+      ...scope,
+    },
+    { environment: process.env },
+  );
   if (
     !observation.ok &&
     !/accessibility-denied|screen-recording-denied/u.test(
@@ -83,22 +156,22 @@ try {
       "capture_native_ui_scenario",
       {
         ...scope,
-        observation_approved: true,
-        actions_approved: true,
-        restore: "leave-as-is",
         screenshot: false,
         steps: [
           { kind: "click", path: button.path },
           { kind: "wait", milliseconds: 200 },
         ],
       },
+      { environment: process.env },
     );
     if (!scenario.ok) throw scenario.error;
     if (
       scenario.value.steps.some((step) => step.outcome !== "completed") ||
       !scenario.value.steps
         .at(-1)
-        ?.after?.nodes.some((node) => node.title === "REA fixture incremented")
+        ?.after?.nodes.some(
+          (node) => node.title === "REA fixture incremented 1",
+        )
     )
       throw new Error(
         `Source-owned AX scenario failed: ${JSON.stringify(scenario.value.steps.map(({ outcome, reason }) => ({ outcome, reason })))}`,
@@ -114,10 +187,6 @@ try {
         String(scope.pid),
         "--window-id",
         String(scope.window_id),
-        "--observation-approved",
-        "--actions-approved",
-        "--restore",
-        "leave-as-is",
         "--steps",
         JSON.stringify([
           { kind: "click", path: button.path },
@@ -132,35 +201,132 @@ try {
       evidence.normalized_result?.steps?.some(
         (step) => step.outcome !== "completed",
       ) ||
-      evidence.normalized_result?.steps?.length !== 2
+      evidence.normalized_result?.steps?.length !== 2 ||
+      !evidence.normalized_result?.steps
+        ?.at(-1)
+        ?.after?.nodes.some(
+          (node) => node.title === "REA fixture incremented 2",
+        )
     )
       throw new Error(
-        `Native UI CLI did not preserve the approved scenario: ${JSON.stringify(evidence.error ?? evidence.normalized_result?.steps?.map(({ outcome, reason }) => ({ outcome, reason })))}`,
+        `Native UI CLI did not preserve the selected scenario: ${JSON.stringify(evidence.error ?? evidence.normalized_result?.steps?.map(({ outcome, reason }) => ({ outcome, reason })))}`,
       );
     scenarioStatus = "selected-AX-button-action-and-CLI-parity-observed";
+    await withArtifactMcp(executable, async (client) => {
+      const observed = await artifactMcpResult(client, "observe_native_ui", {
+        ...scope,
+        screenshot: false,
+      });
+      if (
+        !observed.initial.nodes.some(
+          (node) =>
+            node.role === "AXButton" &&
+            JSON.stringify(node.path) === JSON.stringify(button.path),
+        )
+      )
+        throw new Error("MCP omitted the selected fixture's actual AX button");
+      const captured = await artifactMcpResult(
+        client,
+        "capture_native_ui_scenario",
+        {
+          ...scope,
+          screenshot: false,
+          steps: [
+            { kind: "click", path: button.path },
+            { kind: "wait", milliseconds: 200 },
+          ],
+        },
+      );
+      if (
+        captured.steps.length !== 2 ||
+        captured.steps.some((step) => step.outcome !== "completed") ||
+        !captured.steps
+          .at(-1)
+          ?.after?.nodes.some(
+            (node) => node.title === "REA fixture incremented 3",
+          )
+      )
+        throw new Error("MCP did not observe the selected fixture's AX action");
+    });
+    scenarioStatus = "selected-AX-button-action-and-CLI-MCP-parity-observed";
   }
   const mismatch = await observeNativeUi(
     { ...target.value, sha256: "0".repeat(64) },
     "observe_native_ui",
-    { ...scope, observation_approved: true },
+    scope,
+    { environment: process.env },
   );
-  if (mismatch.ok || !mismatch.error.message.includes("target-mismatch"))
+  // A selection failure carries its helper code in the issue, not in its message.
+  if (
+    mismatch.ok ||
+    !mismatch.error.issues?.some(({ message }) =>
+      message.startsWith("target-mismatch:"),
+    )
+  )
     throw new Error("Real helper did not reject changed target bytes");
-  process.stdout.write(
-    `${JSON.stringify({ ok: true, verification_status: observation.ok ? "passed" : "permission-boundary-only", positive_e2e: observation.ok, observation: observation.ok ? "captured-selected-fixture-window" : "os-permission-denial-verified", scenario: scenarioStatus, permission_failure: observation.ok ? null : observation.error.message, mismatch_rejected: true, target_owned: true })}\n`,
-  );
+  report = {
+    ok: true,
+    verification_status: observation.ok ? "passed" : "permission-boundary-only",
+    positive_e2e: observation.ok,
+    observation: observation.ok
+      ? "captured-selected-fixture-window"
+      : "os-permission-denial-verified",
+    scenario: scenarioStatus,
+    permission_failure: observation.ok ? null : observation.error.message,
+    mismatch_rejected: true,
+    target_owned: true,
+  };
 } finally {
-  if (fixturePid !== undefined) {
-    try {
-      process.kill(fixturePid, "SIGTERM");
-    } catch (error) {
-      if (error.code !== "ESRCH") throw error;
+  if (fixturePid !== undefined && fixtureIdentity?.state === "readable") {
+    const current = await observeProcessStartIdentity(fixturePid);
+    if (current !== undefined) {
+      assert.ok(
+        current.state === "readable" &&
+          current.identity === fixtureIdentity.identity,
+        "Fixture PID identity changed; refusing to signal another process",
+      );
+      try {
+        process.kill(fixturePid, "SIGTERM");
+      } catch (cause) {
+        if (cause.code !== "ESRCH") throw cause;
+      }
     }
   }
-  if (child !== undefined && child.exitCode === null) {
-    const exited = new Promise((resolve) => child.once("exit", resolve));
-    child.kill("SIGTERM");
-    await exited;
+  const fixtureExited =
+    child === undefined || (await openExitedWithFixture(child, childExit));
+  if (fixtureExited) await rm(root, { recursive: true, force: true });
+  else {
+    // The app may have been reparented away from `open`; stopping `open`
+    // does not prove the fixture exited, so its root stays in place.
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await childExit;
+    }
+    retainedRoot = root;
+    process.stderr.write(
+      `Source-owned UI fixture exit was not observed; retained ${root}\n`,
+    );
   }
-  await rm(root, { recursive: true, force: true });
+}
+if (retainedRoot !== undefined)
+  throw new Error(
+    `Source-owned UI fixture exit was not observed; retained ${retainedRoot}`,
+  );
+process.stdout.write(`${JSON.stringify(report)}\n`);
+
+// `open -W` exits on its own only after the app exits (or never launched it).
+// A signaled `open`, or none within the grace period, leaves the app unproven.
+async function openExitedWithFixture(launcher, exit) {
+  if (launcher.exitCode === null && launcher.signalCode === null) {
+    let timer;
+    const exited = await Promise.race([
+      exit.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), FIXTURE_EXIT_GRACE_MS);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (!exited) return false;
+  }
+  return launcher.exitCode !== null && launcher.signalCode === null;
 }

@@ -1,11 +1,72 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-import { readReferenceSource } from "../../../src/reference/ReferenceSourceReader.js";
+import { readStableSymlinkTarget } from "../../../src/reference/ReferenceSourceReaderEntries.js";
+import { readReferenceSource } from "../../support/referenceSourceResourceScope.js";
+import { ok } from "../../../src/domain/result.js";
+
+it.each(["rejected", "returned"] as const)(
+  "retains a symlink's physical failure when cancellation accompanies its %s outcome",
+  async (outcome) => {
+    const root = await createTestTempDirectory("rea-reference-link-failure-");
+    const link = join(root, "alias");
+    await symlink("target", link);
+    const expected = await lstat(link, { bigint: true });
+    const controller = new AbortController();
+    const physical = Object.assign(new Error("authored link EIO"), {
+      code: "EIO",
+    });
+    const result = await readStableSymlinkTarget(
+      link,
+      "alias",
+      expected,
+      controller.signal,
+      async () => {
+        controller.abort("during link failure");
+        if (outcome === "rejected") throw physical;
+        return {
+          status: "failed",
+          kind: "symlink",
+          path: "alias",
+          code: "io",
+          message: "authored link EIO",
+        };
+      },
+    );
+    expect(result).toMatchObject({
+      status: "failed",
+      kind: "symlink",
+      path: "alias",
+      code: "io",
+    });
+  },
+);
+
+it("retains the caller reason and observed entries when traversal is cancelled", async () => {
+  const root = await createTestTempDirectory("rea-reference-cancel-");
+  await writeFile(join(root, "observed.js"), "observed");
+  await mkdir(join(root, "nested"));
+  const controller = new AbortController();
+  const reason = { requested: "stop traversal" };
+  const result = await readReferenceSource(root, {
+    signal: controller.signal,
+    beforeDirectory: async (path) => {
+      if (path === "nested") controller.abort(reason);
+      return ok(undefined);
+    },
+  });
+  if (result.ok) throw new Error("Expected cancellation");
+  expect(result.error.code).toBe("cancelled");
+  expect(result.error.cause).toBe(reason);
+  expect(result.error.partial?.entries).toContainEqual(
+    expect.objectContaining({ path: "observed.js", status: "read" }),
+  );
+});
 
 describe("readReferenceSource entries", () => {
   it("returns explicit entries in canonical code-point path order", async () => {
@@ -19,8 +80,7 @@ describe("readReferenceSource entries", () => {
 
     const result = await readReferenceSource(root);
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value.entries.map(({ path }) => path)).toEqual([
       "a.js",
       "nested",
@@ -42,7 +102,7 @@ describe("readReferenceSource entries", () => {
     expect(result.value.limitations).toHaveLength(1);
   });
 
-  it("sanitizes internal, external, and missing symlink targets", async () => {
+  it("reports physical external symlink targets without following them", async () => {
     const root = await createTestTempDirectory("rea-reference-");
     const outside = await createTestTempDirectory("rea-outside-");
     await writeFile(join(outside, "secret"), "secret");
@@ -53,14 +113,13 @@ describe("readReferenceSource entries", () => {
 
     const result = await readReferenceSource(root);
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value.entries).toEqual([
       {
         status: "read",
         kind: "symlink",
         path: "external",
-        target: "<outside-root>",
+        target: join(outside, "secret"),
         targetState: "external",
       },
       {
@@ -86,18 +145,53 @@ describe("readReferenceSource entries", () => {
       },
     ]);
     expect(result.value.bytesRead).toBe(5);
-    expect(JSON.stringify(result.value.entries)).not.toContain(outside);
+    expect(JSON.stringify(result.value.entries)).toContain(
+      join(outside, "secret"),
+    );
+  });
+
+  it("marks a symlink changed when its path is replaced during target observation", async () => {
+    const root = await createTestTempDirectory("rea-reference-symlink-race-");
+    const link = join(root, "source-link");
+    await symlink("original-target", link);
+    const expected = await lstat(link, { bigint: true });
+
+    const result = await readStableSymlinkTarget(
+      link,
+      "source-link",
+      expected,
+      undefined,
+      async () => {
+        await unlink(link);
+        await symlink("replacement-target", link);
+        return {
+          status: "read",
+          kind: "symlink",
+          path: "source-link",
+          target: "original-target",
+          targetState: "missing",
+        };
+      },
+    );
+
+    expect(result).toEqual({
+      status: "failed",
+      kind: "symlink",
+      path: "source-link",
+      code: "changed",
+      message: "Symbolic link changed while its target was read",
+    });
   });
 
   it("reads a source file larger than the former 16 MiB ceiling", async () => {
     const root = await createTestTempDirectory("rea-reference-large-");
     const size = 16 * 1024 * 1024 + 1;
-    await writeFile(join(root, "large.bin"), Buffer.alloc(size, 0x61));
+    const bytes = Buffer.alloc(size, 0x61);
+    await writeFile(join(root, "large.bin"), bytes);
 
     const result = await readReferenceSource(root);
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     expect(result.value.bytesRead).toBe(size);
     expect(result.value.entries).toContainEqual(
       expect.objectContaining({
@@ -106,6 +200,15 @@ describe("readReferenceSource entries", () => {
         path: "large.bin",
         size,
       }),
+    );
+    const entry = result.value.entries.find(
+      (entry) => entry.path === "large.bin",
+    );
+    if (entry?.status !== "read" || entry.kind !== "file")
+      throw new Error("Expected captured file bytes");
+    expect(entry.bytes.byteLength).toBe(size);
+    expect(createHash("sha256").update(entry.bytes).digest("hex")).toBe(
+      createHash("sha256").update(bytes).digest("hex"),
     );
   });
 
@@ -118,8 +221,7 @@ describe("readReferenceSource entries", () => {
 
     const result = await readReferenceSource(root);
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
+    if (!result.ok) throw result.error;
     const path = [...segments, "deep.txt"].join("/");
     expect(result.value.entries).toContainEqual(
       expect.objectContaining({ status: "read", kind: "file", path }),
@@ -129,23 +231,28 @@ describe("readReferenceSource entries", () => {
 });
 
 describe("readReferenceSource failures and exclusions", () => {
-  it("applies exclusions to normalized paths before reading entries", async () => {
+  it("applies exclusions to normalized paths after no-follow type inspection", async () => {
     const root = await createTestTempDirectory("rea-reference-");
     await mkdir(join(root, "ignored"));
     await writeFile(join(root, "ignored", "secret"), "secret");
     await writeFile(join(root, "kept"), "kept");
-    const checked: string[] = [];
+    const checked: Array<[string, string]> = [];
 
     const result = await readReferenceSource(root, {
-      shouldExclude: (path) => {
-        checked.push(path);
+      shouldExclude: (path, kind) => {
+        checked.push([path, kind]);
         return path === "ignored";
       },
     });
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    expect(checked).toEqual(["ignored", "kept"]);
+    if (!result.ok) throw result.error;
+    expect(checked).toHaveLength(2);
+    expect(checked).toEqual(
+      expect.arrayContaining([
+        ["ignored", "directory"],
+        ["kept", "file"],
+      ]),
+    );
     expect(result.value.entries.map(({ path }) => path)).toEqual(["kept"]);
   });
 
@@ -158,26 +265,28 @@ describe("readReferenceSource failures and exclusions", () => {
       },
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       ok: false,
       error: {
         tag: "reference-source-reader",
         code: "io",
         message: "Reference source exclusion check failed",
+        partial: {
+          root,
+          entries: [],
+          bytesRead: 0,
+        },
       },
     });
   });
 
-  it("sanitizes filesystem errors", async () => {
+  it("keeps selected-root paths in actionable filesystem errors", async () => {
     const missing = join(tmpdir(), "rea-secret-root-that-does-not-exist");
     const result = await readReferenceSource(missing);
 
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.message).toBe(
-      "Reference source root could not be resolved",
-    );
-    expect(result.error.message).not.toContain(missing);
+    expect(result.error.message).toContain(missing);
   });
 
   it("returns typed failures for cancellation and invalid roots", async () => {
@@ -192,6 +301,7 @@ describe("readReferenceSource failures and exclusions", () => {
         tag: "reference-source-reader",
         code: "cancelled",
         message: "Reference source traversal cancelled",
+        cause: controller.signal.reason,
       },
     });
 

@@ -1,61 +1,57 @@
+import { isDeepStrictEqual } from "node:util";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 import type { ProviderIdentity } from "./AnalysisProvider.js";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import type { BrowserScenarioCapture } from "../domain/browserScenarioCapture.js";
-import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import {
   createEvidence,
   type Evidence,
   type EvidenceObservation,
 } from "../domain/evidence.js";
-import { jsonValueSchema } from "../domain/jsonValue.js";
-import { digestJson } from "./JavaScriptReplayPlanning.js";
+import { jsonObjectSchema, type JsonValue } from "../domain/jsonValue.js";
+
+/** The own JSON capture and the facts admitted by its named output contract. */
+export interface BrowserScenarioEvidenceReport {
+  readonly source: JsonValue;
+  readonly facts: BrowserScenarioCapture;
+}
 
 const browserScenarioParameters = (
   scenario: BrowserScenario,
-): EvidenceObservation["parameters"] => ({
-  scenario_sha256: digestJson(scenario),
-  browser_mode: scenario.browser.mode,
-  start_url: sanitizeBrowserUrl(scenario.start_url.url),
-  allowed_origins: scenario.allowed_origins,
-  actions: scenario.actions.map(({ step_id, action }) => ({
-    step_id,
-    action,
-  })),
-  action_timeouts_ms: scenario.actions.map((item) =>
-    "timeout_ms" in item ? (item.timeout_ms ?? null) : null,
-  ),
-  secret_declarations: scenario.secrets.map(
-    ({ secret_id, environment_variable, purpose, redaction }) => ({
-      secret_id,
-      environment_variable,
-      purpose,
-      redaction,
-    }),
-  ),
-  capture: scenario.capture,
-});
+): EvidenceObservation["parameters"] => {
+  return {
+    ...jsonObjectSchema.parse(scenario),
+    scenario_sha256: digestCanonicalValue(scenario, "Browser scenario"),
+  };
+};
 
 /** Create Evidence without retaining resolved scenario secret values. */
 export const createBrowserScenarioEvidence = (
   scenario: BrowserScenario,
-  capture: BrowserScenarioCapture,
+  report: BrowserScenarioEvidenceReport,
   provider: ProviderIdentity,
-): Evidence =>
-  createEvidence(undefined, provider, {
+): Evidence => {
+  const capture = report.facts;
+  return createEvidence(undefined, provider, {
     predicateType: "rea.browser-scenario-capture",
     operation: "capture_browser_scenario",
     parameters: browserScenarioParameters(scenario),
-    result: jsonValueSchema.parse(capture),
+    result: capture,
+    rawResult: isDeepStrictEqual(report.source, capture) ? null : report.source,
     confidence: "observed",
     authority: "controlled-replay",
     environment: {
       id: `${capture.browser.product}@${capture.browser.version}`,
-      platform: process.platform,
-      architecture: process.arch,
+      platform: "unknown",
+      architecture: "unknown",
       isolation:
         capture.browser.process_ownership === "provider-owned"
           ? "process"
           : "none",
     },
-    limitations: capture.limitations,
+    limitations: [
+      ...capture.limitations,
+      "Browser host platform and architecture were not observed.",
+    ],
   });
+};

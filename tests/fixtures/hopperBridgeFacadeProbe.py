@@ -30,7 +30,7 @@ class FakeDocument:
         return 0x401000
 
     def getSegmentsList(self):
-        return [FakeInventorySegment()]
+        return []
 
 
 class FakeDocumentProvider:
@@ -47,49 +47,74 @@ class FakeDocumentProvider:
         return cls.current
 
 
-class FakeStringSegment:
-    def getStringsList(self):
-        return [("fixture string", FakeStringAddress())]
-
-
-class FakeStringAddress:
-    def __init__(self, value="0x401234"):
-        self.value = value
-
-    def __str__(self):
-        return self.value
-
-
-class FakeInventorySegment:
-    addresses = [FakeStringAddress("0x10"), 0x100, 0x2]
-
-    def getStringsList(self):
-        return [
-            ("string-" + str(self.number(address)), address)
-            for address in self.addresses
-        ]
-
-    def getNamedAddresses(self):
-        return self.addresses
-
+class FakeReferenceSegment:
     def getNameAtAddress(self, address):
-        return "name-" + str(self.number(address))
+        return "fixture-procedure"
 
-    @staticmethod
-    def number(address):
-        return address if isinstance(address, int) else int(str(address), 16)
+    def getReferencesFromAddress(self, address):
+        return []
+
+    def getReferencesOfAddress(self, address):
+        return []
+
+    def getCommentAtAddress(self, address):
+        return None
+
+    def getInlineCommentAtAddress(self, address):
+        return None
 
 
-class FakeStringsDocument:
-    def getSegmentsList(self):
-        return [FakeStringSegment()]
+class FakeProcedure:
+    def __init__(self, segment):
+        self.segment = segment
+
+    def getEntryPoint(self):
+        return 0x401000
+
+    def getSegment(self):
+        return self.segment
+
+    def basicBlockIterator(self):
+        return [FakeBlock()]
+
+    def getBasicBlockAtAddress(self, address):
+        return None
+
+    def getBasicBlockCount(self):
+        return 1
+
+    def signatureString(self):
+        return "int fixture-procedure()"
+
+    def getLocalVariableList(self):
+        return []
+
+    def getAllCallees(self):
+        return []
+
+    def getAllCallerProcedures(self):
+        return []
+
+    def getAllCalleeProcedures(self):
+        return []
 
 
-def load_bridge(path):
+class FakeBlock:
+    def getStartingAddress(self):
+        return 0x401000
+
+    def getEndingAddress(self):
+        return 0x401004
+
+    def getSuccessorCount(self):
+        return 0
+def load_bridge(path, namespace_updates=None):
     namespace = {
         "__file__": path,
         "__name__": "rea_hopper_bridge",
     }
+    if namespace_updates:
+        namespace.update(namespace_updates)
     source = Path(path).read_text(encoding="utf-8")
     exec(compile(source, path, "exec"), namespace)
     return namespace
@@ -137,9 +162,8 @@ def main():
 
     bridge["REA_TARGET_PATH"] = "/tmp/rea-hopper-facade-fixture"
     bridge["REA_OWNS_PROCESS_LIFETIME"] = False
-    bridge["_configure_hopper_api"](FakeDocumentProvider)
+    bridge["Document"] = FakeDocumentProvider
     bridge["_bind_session_document"]()
-    strings = bridge["_strings"](FakeStringsDocument())
     current = bridge["_dispatch"]("current_document", {})
     current_address = bridge["_dispatch"]("current_address", {})
     selected = bridge["_session_document"]() is FakeDocumentProvider.current
@@ -158,17 +182,33 @@ def main():
     bridge["REA_TOKEN"] = "probe-token"
     FakeDocumentProvider.document.analysis_active = False
     FakeDocumentProvider.current.analysis_active = False
-    inventories = bridge_replies(bridge, [
-        request(method, params, index)
-        for index, (method, params) in enumerate([
-            ("list_strings", {}),
-            ("list_names", {}),
-            ("list_strings", {"address": "0x10"}),
-            ("list_names", {"address": "0x10"}),
-            ("list_strings", {"address": "0xff"}),
-            ("list_names", {"address": "0xff"}),
-        ], 1)
-    ])
+    reference_segment = FakeReferenceSegment()
+    reference_procedure = FakeProcedure(reference_segment)
+    bridge["_procedure"] = lambda document, value=None: reference_procedure
+    bridge["_instruction_addresses"] = lambda procedure: [0x401000]
+    bridge["_segment"] = lambda document, address: reference_segment
+    bridge["_containing_procedure"] = lambda document, address: (
+        reference_procedure,
+        None,
+    )
+    containing_procedure = bridge["_dispatch"](
+        "resolve_containing_procedure", {"address": "0x401000"}
+    )
+    procedure_references = bridge["_dispatch"](
+        "procedure_references",
+        {"procedure": "0x401000", "direction": "outgoing"},
+    )
+    procedure_info = bridge["_dispatch"](
+        "procedure_info", {"procedure": "0x401000"}
+    )
+    bridge["_assembly"] = lambda procedure: "ret"
+    bridge["_pseudocode"] = lambda document, procedure: None
+    bridge["_native_calls"] = lambda procedure, direction: ({}, [])
+    bridge["_string_inventory"] = lambda document, targets=None: {}
+    bridge["_search_inventory"] = lambda document, kind: []
+    analyze_function = bridge["_dispatch"](
+        "analyze_function", {"procedure": "0x401000"}
+    )
     provider_faults = []
     for error_type in (TypeError, ValueError, KeyError):
         FakeDocumentProvider.current.address_error = error_type("credential=supersecret")
@@ -218,8 +258,10 @@ def main():
                 "imported_without_hopper": unavailable,
                 "current_document": current,
                 "current_address": current_address,
-                "strings": strings,
-                "inventory_replies": inventories,
+                "containing_procedure": containing_procedure,
+                "procedure_references": procedure_references,
+                "procedure_info": procedure_info,
+                "analyze_function": analyze_function,
                 "provider_faults": provider_faults,
                 "malformed_requests": malformed_requests,
                 "session_document_reused": selected,

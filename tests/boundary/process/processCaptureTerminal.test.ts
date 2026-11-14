@@ -1,187 +1,145 @@
-import { rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { expect } from "vitest";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import { itWithCaptureCapability } from "./processCaptureCapability.js";
 
-import {
-  captureProcessScenario,
-  probeProcessCaptureCapability,
-} from "../../../src/application/ProcessHarness.js";
-import { parseProcessScenario } from "../../../src/domain/processCapture.js";
+import { captureProcessScenario } from "../../../src/process/capture/ProcessHarness.js";
+import { processScenarioSchema } from "../../../src/domain/process/processScenario.js";
 
-const buildTerminalScenario = (root: string, script: string) =>
-  parseProcessScenario({
-    executable: process.execPath,
-    arguments: [script],
-    working_directory: root,
-    checkpoints: [
-      {
-        name: "probe_seen",
-        trigger: { type: "terminal_literal", value: "probe:codex 1.2.3" },
-      },
-    ],
-    command_shims: [
-      {
-        name: "codex",
-        routes: [
-          {
-            arguments: ["--version"],
-            outputs: [{ at_ms: 0, stream: "stdout", data: "codex 1.2.3\n" }],
-            termination: { type: "exit", code: 0 },
-          },
-        ],
-      },
-      {
-        name: "node",
-        routes: [
-          {
-            arguments: ["--version"],
-            outputs: [{ at_ms: 0, stream: "stdout", data: "node 9.8.7\n" }],
-            termination: { type: "exit", code: 0 },
-          },
-        ],
-      },
-    ],
-    reactive: {
-      initial_state: "waiting_for_shim",
-      deadline_ms: 5_000,
-      states: [
-        {
-          id: "waiting_for_shim",
-          max_visits: 1,
-          deadline_ms: 2_000,
-          on: [
-            {
-              id: "record_shim",
-              priority: 0,
-              max_uses: 1,
-              when: {
-                kind: "event",
-                source: "shim",
-                exact: {
-                  command: "codex",
-                  route_index: 0,
-                  arguments: ["--version"],
-                  working_directory: "<working-directory>",
-                  outcome: "matched",
-                },
-                ignore_fields: ["sequence", "at_ms"],
-                since: { kind: "scenario_start" },
-                consume: true,
-                cardinality: { min: 1, max: 1 },
-              },
-              actions: [{ type: "checkpoint", name: "reactive_shim_seen" }],
-              target: {
-                kind: "goto",
-                state: "waiting_for_checkpoint",
-              },
-            },
-          ],
-        },
-        {
-          id: "waiting_for_checkpoint",
-          max_visits: 1,
-          deadline_ms: 2_000,
-          on: [
-            {
-              id: "finish_checkpoint",
-              priority: 0,
-              max_uses: 1,
-              when: {
-                kind: "event",
-                source: "filesystem",
-                exact: {
-                  name: "reactive_shim_seen",
-                  files: [],
-                  effects: [],
-                  truncated: false,
-                },
-                ignore_fields: ["at_ms"],
-                since: { kind: "scenario_start" },
-                consume: true,
-                cardinality: { min: 1, max: 1 },
-              },
-              actions: [],
-              target: { kind: "finish", outcome: "passed" },
-            },
-          ],
-        },
-      ],
-    },
-  });
-
-// The assertions share one captured process and therefore one cleanup scope.
-it("renders terminal state, records shim invocations, and captures literal checkpoints", async () => {
-  const root = await createTestTempDirectory("rea-v3-test-");
-  const script = join(root, "scenario.mjs");
-  await writeFile(
-    script,
-    [
-      'import { spawnSync } from "node:child_process";',
-      'const result = spawnSync("codex", ["--version"], { encoding: "utf8" });',
-      'const node = spawnSync("node", ["--version"], { encoding: "utf8" });',
-      "process.stdout.write(`probe:${result.stdout}`);",
-      "process.stdout.write(`runtime:${node.stdout}`);",
-    ].join("\n"),
-  );
-  try {
-    const capability = await probeProcessCaptureCapability();
-    if (!capability.available) return;
+itWithCaptureCapability(
+  "normalizes wide terminal cells without inventing blank cells",
+  async () => {
     const result = await captureProcessScenario(
-      buildTerminalScenario(root, script),
-      {
-        status: "enabled",
-        executableRoots: [dirname(process.execPath)],
-        workingRoots: [root],
-        allowedEnvironment: [],
-        networkAccess: "external",
-      },
+      processScenarioSchema.parse({
+        executable: process.execPath,
+        arguments: ["-e", 'process.stdout.write("界")'],
+        terminal: { columns: 4, rows: 1, scrollback: 0 },
+        normalization: {
+          patterns: [{ pattern: " ", replacement: "_" }],
+        },
+      }),
     );
-    expect(result.ok).toBe(true);
     if (!result.ok) throw result.error;
-    expect(result.value.rendered_frames.at(-1)?.lines.join("\n")).toContain(
-      "probe:codex 1.2.3",
-    );
-    expect(result.value.shim_events).toEqual([
-      expect.objectContaining({
-        command: "codex",
-        arguments: ["--version"],
-        outcome: "matched",
-      }),
-      expect.objectContaining({
-        command: "node",
-        arguments: ["--version"],
-        outcome: "matched",
-      }),
-    ]);
-    expect(result.value.filesystem_checkpoints.map(({ name }) => name)).toEqual(
-      expect.arrayContaining([
-        "before",
-        "reactive_shim_seen",
-        "probe_seen",
-        "after_settlement",
-      ]),
-    );
-    expect(result.value.reactive_run).toMatchObject({
-      status: "finished",
-      outcome: "passed",
-      transitions: [
-        expect.objectContaining({
-          transition_id: "record_shim",
-          trigger_event_ids: ["obs.shim_events.0"],
-          action_event_ids: [
-            expect.stringMatching(/^obs\.filesystem_checkpoints\./u),
-          ],
-        }),
-        expect.objectContaining({
-          transition_id: "finish_checkpoint",
-          trigger_event_ids: [
-            expect.stringMatching(/^obs\.filesystem_checkpoints\./u),
-          ],
-        }),
-      ],
+    expect(
+      result.value.frames
+        .map(({ raw_data, data }) => raw_data ?? data)
+        .join(""),
+    ).toBe("界");
+    expect(result.value.rendered_frames.at(-1)).toMatchObject({
+      columns: 4,
+      cursor_x: 2,
+      lines: ["界__"],
     });
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-}, 20_000);
+    expect(result.value.cleanup).toMatchObject({
+      owned_process_group: "verified",
+      temporary_root: "removed",
+    });
+  },
+  20_000,
+);
+
+itWithCaptureCapability(
+  "captures one command's terminal output, selected files, and owned cleanup",
+  async () => {
+    const root = await createTestTempDirectory("rea-process-capture-");
+    const script = join(root, "task.mjs");
+    await writeFile(
+      script,
+      [
+        'import { writeFile } from "node:fs/promises";',
+        "process.stdout.write(`value:${process.env.CAPTURE_VALUE}\\n`);",
+        'await writeFile("state.txt", "created");',
+      ].join("\n"),
+    );
+    try {
+      const result = await captureProcessScenario(
+        processScenarioSchema.parse({
+          executable: process.execPath,
+          arguments: [script],
+          working_directory: root,
+          environment: { CAPTURE_VALUE: "caller-selected" },
+          filesystem_observation_paths: ["."],
+        }),
+      );
+      if (!result.ok) throw result.error;
+      expect(result.value.frames.map(({ data }) => data).join("")).toContain(
+        "value:caller-selected",
+      );
+      expect(result.value.files_after).toContainEqual(
+        expect.objectContaining({ path: "root_0:state.txt" }),
+      );
+      expect(result.value.filesystem_effects).toContainEqual(
+        expect.objectContaining({
+          status: "created",
+          path: "root_0:state.txt",
+        }),
+      );
+      expect(result.value.cleanup).toMatchObject({
+        owned_process_group: "verified",
+        temporary_root: "removed",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+itWithCaptureCapability(
+  "executes and observes the selected symlink/.. directory without touching its lexical decoy",
+  async () => {
+    const root = await createTestTempDirectory("rea-process-native-traversal-");
+    const intended = join(root, "intended");
+    await mkdir(join(intended, "nested"), { recursive: true });
+    await symlink(join(intended, "nested"), join(root, "alias"));
+    for (const [directory, label] of [
+      [root, "decoy"],
+      [intended, "intended"],
+    ] as const) {
+      await mkdir(join(directory, "observed"));
+      await writeFile(join(directory, "observed", "state.txt"), "before");
+      await writeFile(
+        join(directory, "probe"),
+        `#!/bin/sh\nprintf '${label}'\nprintf after > observed/state.txt\n`,
+        { mode: 0o755 },
+      );
+    }
+    const selected = `${root}/alias/..`;
+    const result = await captureProcessScenario(
+      processScenarioSchema.parse({
+        executable: `${selected}/probe`,
+        working_directory: selected,
+        filesystem_observation_paths: [`${selected}/observed`],
+      }),
+    );
+    if (!result.ok) throw result.error;
+    expect(result.value.frames.map(({ data }) => data).join("")).toBe(
+      "intended",
+    );
+    expect(await readFile(join(root, "observed", "state.txt"), "utf8")).toBe(
+      "before",
+    );
+    expect(
+      await readFile(join(intended, "observed", "state.txt"), "utf8"),
+    ).toBe("after");
+    const before = result.value.files_before.find(
+      ({ path }) => path === "root_0:state.txt",
+    );
+    const after = result.value.files_after.find(
+      ({ path }) => path === "root_0:state.txt",
+    );
+    expect(before?.sha256).toBe(
+      createHash("sha256").update("before").digest("hex"),
+    );
+    expect(after?.sha256).toBe(
+      createHash("sha256").update("after").digest("hex"),
+    );
+    expect(result.value.cleanup).toMatchObject({
+      owned_process_group: "verified",
+      temporary_root: "removed",
+    });
+  },
+  20_000,
+);

@@ -4,14 +4,39 @@ import {
   probeWindowsCapabilities,
   systemNoFollowOpenCapability,
   type WindowsCapabilityDependencies,
-} from "../../../../src/application/WindowsCapabilities.js";
-import { WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON } from "../../../../src/process/WindowsAuthority.js";
+} from "../../../../scripts/lib/windows-capabilities.mjs";
 
 const dependencies = (
   overrides: Partial<WindowsCapabilityDependencies> = {},
 ): WindowsCapabilityDependencies => ({
   platform: "win32",
   architecture: "x64",
+  nativeCapabilities: () => ({
+    job_object_process_ownership: {
+      available: false,
+      reason: "Authored Job Object authority unavailable diagnostic",
+      proof: "not-proven",
+      code: "runtime_missing",
+      failureStage: "artifact",
+      remediation: "Install the matching Windows x64 REA package.",
+    },
+    private_runtime_dacl: {
+      available: false,
+      reason: "Authored private DACL authority unavailable diagnostic",
+      proof: "not-proven",
+      code: "runtime_missing",
+      failureStage: "artifact",
+      remediation: "Install the matching Windows x64 REA package.",
+    },
+    reparse_safe_path_admission: {
+      available: false,
+      reason: "Authored reparse admission authority unavailable diagnostic",
+      proof: "not-proven",
+      code: "runtime_missing",
+      failureStage: "artifact",
+      remediation: "Install the matching Windows x64 REA package.",
+    },
+  }),
   probeSymlinkCreation: () =>
     Promise.resolve({ available: false, reason: "EPERM" }),
   probeNoFollowOpen: () => ({
@@ -39,7 +64,8 @@ describe("Windows host capability report", () => {
   it("never treats a numeric POSIX flag as Windows reparse authority", () => {
     expect(systemNoFollowOpenCapability("win32", 0x20_000)).toEqual({
       available: false,
-      reason: "Windows reparse-safe handle admission is not implemented",
+      reason:
+        "Node pathname O_NOFOLLOW is not Windows handle authority; native admission is reported separately in security.",
     });
     expect(systemNoFollowOpenCapability("linux", 0x20_000)).toEqual({
       available: true,
@@ -71,18 +97,27 @@ describe("Windows host capability report", () => {
       security: {
         job_object_process_ownership: {
           available: false,
-          reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+          reason: "Authored Job Object authority unavailable diagnostic",
           proof: "not-proven",
+          code: "runtime_missing",
+          failureStage: "artifact",
+          remediation: "Install the matching Windows x64 REA package.",
         },
         private_runtime_dacl: {
           available: false,
-          reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+          reason: "Authored private DACL authority unavailable diagnostic",
           proof: "not-proven",
+          code: "runtime_missing",
+          failureStage: "artifact",
+          remediation: "Install the matching Windows x64 REA package.",
         },
         reparse_safe_path_admission: {
           available: false,
-          reason: WINDOWS_NATIVE_AUTHORITY_UNAVAILABLE_REASON,
+          reason: "Authored reparse admission authority unavailable diagnostic",
           proof: "not-proven",
+          code: "runtime_missing",
+          failureStage: "artifact",
+          remediation: "Install the matching Windows x64 REA package.",
         },
       },
     });

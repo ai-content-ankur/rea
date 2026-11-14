@@ -1,39 +1,31 @@
 import { z } from "zod";
 
+import { webRuntimeCommandTimeoutSchema } from "./browserDeadline.js";
 import {
   browserScenarioActionSchema,
-  browserScenarioAllowedOriginsSchema,
+  BROWSER_SCENARIO_START_STEP_ID,
   browserScenarioBrowserSchema,
   browserScenarioCaptureSchema,
   browserScenarioEnvironmentSchema,
-  browserScenarioRedactionSchema,
-  browserScenarioRequestReplaySchema,
   browserScenarioSecretSchema,
   browserScenarioStorageSchema,
   browserScenarioUrlSchema,
+  HEADER_FIELD_VALUE,
   type BrowserScenarioAction,
   type BrowserScenarioUrl,
   type BrowserScenarioValue,
+  SAVED_URL_PLACEHOLDER,
+  savedPlaceholderNames,
+  validBasicCredentialUsername,
 } from "./browserScenarioValues.js";
-
-export {
-  browserScenarioActionSchema,
-  browserScenarioUrlSchema,
-  browserScenarioValueSchema,
-  type BrowserScenarioAction,
-  type BrowserScenarioUrl,
-  type BrowserScenarioValue,
-} from "./browserScenarioValues.js";
+import type { JsonValue } from "./jsonValue.js";
 
 export const browserScenarioInputSchema = z.strictObject({
   browser: browserScenarioBrowserSchema.describe(
-    "Required launch/connect authority. Launch uses the approved executable and an owned temporary profile; connect uses one approved loopback CDP endpoint and target.",
+    "Required launch/connect selection. Launch uses the selected executable and an owned temporary profile; connect uses one loopback CDP endpoint and target.",
   ),
   start_url: browserScenarioUrlSchema.describe(
     "Required initial HTTP(S) URL. Query values must be declared separately as public literals or secret references.",
-  ),
-  allowed_origins: browserScenarioAllowedOriginsSchema.describe(
-    "Required exact HTTP(S) origins for the start URL and every later navigation, storage seed, and replay route.",
   ),
   environment: browserScenarioEnvironmentSchema,
   actions: z
@@ -41,15 +33,14 @@ export const browserScenarioInputSchema = z.strictObject({
     .min(1)
     .describe("Required sequence of explicit browser actions."),
   storage: browserScenarioStorageSchema,
-  request_replay: browserScenarioRequestReplaySchema,
   secrets: z
     .array(browserScenarioSecretSchema)
     .default([])
     .describe(
-      "Optional references to approved environment variables. Secret values are never supplied inline; declarations are required only when an action, URL, storage value, or replay route references a secret.",
+      "Optional environment-variable references for values used in actions, URLs, storage, or replay, and for redacting matching observed text. Secret values are never supplied inline.",
     ),
-  redaction: browserScenarioRedactionSchema,
   capture: browserScenarioCaptureSchema,
+  command_timeout_ms: webRuntimeCommandTimeoutSchema,
 });
 
 type ScenarioShape = z.infer<typeof browserScenarioInputSchema>;
@@ -70,26 +61,50 @@ const assertUnique = (
     addIssue(context, path, `${label} must be unique`);
 };
 
-const originFor = (destination: BrowserScenarioUrl): string =>
-  new URL(destination.url).origin;
-
-const assertAllowedDestination = (
-  destination: BrowserScenarioUrl,
-  allowedOrigins: ReadonlySet<string>,
-  path: PropertyKey[],
-  context: z.RefinementCtx,
-): void => {
-  if (!allowedOrigins.has(originFor(destination)))
-    addIssue(
-      context,
-      path,
-      `URL origin ${originFor(destination)} is not declared in allowed_origins`,
-    );
-};
-
 const secretReferencesInValue = (
   value: BrowserScenarioValue | undefined,
 ): readonly string[] => (value?.source === "secret" ? [value.secret_id] : []);
+
+/** A request step's header values, with Basic credentials as their two parts. */
+const headerValues = (
+  action: Extract<BrowserScenarioAction, { action: "request" }>,
+) =>
+  action.headers.flatMap(({ value }) =>
+    value.source === "basic_credentials" ? value.parts : [value],
+  );
+
+/** Every string in a JSON value, at any depth. */
+const jsonStrings = (value: JsonValue | undefined): readonly string[] => {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(jsonStrings);
+  if (value !== null && typeof value === "object")
+    return Object.values(value).flatMap(jsonStrings);
+  return [];
+};
+
+/** The saved values a step sends: `{saved:name}` in a request path, JSON string or goto URL, and saved header values and credential parts. */
+const sentSavedNames = (action: BrowserScenarioAction): readonly string[] => {
+  if (action.action === "goto")
+    return savedPlaceholderNames(action.destination.url, SAVED_URL_PLACEHOLDER);
+  if (action.action !== "request") return [];
+  return [
+    ...[action.path, ...jsonStrings(action.json)].flatMap((text) =>
+      savedPlaceholderNames(text),
+    ),
+    ...headerValues(action).flatMap((value) =>
+      value.source === "saved" ? [value.name] : [],
+    ),
+  ];
+};
+
+/** The names a step saves: a request's `save`, or a UI step's `save_response`. */
+const savedNames = (action: BrowserScenarioAction): readonly string[] =>
+  action.action === "request"
+    ? action.save.map(({ name }) => name)
+    : (action.action === "click" || action.action === "press") &&
+        action.save_response !== undefined
+      ? action.save_response.save.map(({ name }) => name)
+      : [];
 
 const destinationSecretReferences = (
   destination: BrowserScenarioUrl,
@@ -103,146 +118,125 @@ const actionSecretReferences = (
     return secretReferencesInValue(action.value);
   if (action.action === "goto")
     return destinationSecretReferences(action.destination);
+  if (action.action === "request")
+    return [
+      ...action.query.flatMap(({ value }) => secretReferencesInValue(value)),
+      ...headerValues(action).flatMap((value) =>
+        value.source === "secret" ? [value.secret_id] : [],
+      ),
+    ];
   return [];
 };
 
-const validateStorage = (
+/** Each saved value a step sends was saved by an earlier step. */
+const validateSavedValues = (
   scenario: ScenarioShape,
-  allowedOrigins: ReadonlySet<string>,
   context: z.RefinementCtx,
-): readonly string[] => {
-  const references: string[] = [];
-  scenario.storage.cookies.forEach((cookie, index) => {
-    assertAllowedDestination(
-      cookie.destination,
-      allowedOrigins,
-      ["storage", "cookies", index, "destination"],
-      context,
-    );
-    references.push(...secretReferencesInValue(cookie.value));
-    references.push(...destinationSecretReferences(cookie.destination));
-  });
-  for (const collection of ["local_storage", "session_storage"] as const)
-    scenario.storage[collection].forEach((storage, index) => {
-      if (!allowedOrigins.has(storage.origin))
+): void => {
+  const saved = new Set<string>();
+  scenario.actions.forEach((action, index) => {
+    for (const name of new Set(sentSavedNames(action)))
+      if (!saved.has(name))
         addIssue(
           context,
-          ["storage", collection, index, "origin"],
-          `Storage origin ${storage.origin} is not declared in allowed_origins`,
+          ["actions", index],
+          `Step ${action.step_id} sends saved value ${name}, which no earlier step saves`,
         );
-      for (const entry of storage.entries)
-        references.push(...secretReferencesInValue(entry.value));
-    });
-  return references;
+    for (const name of savedNames(action)) saved.add(name);
+  });
 };
 
-const SENSITIVE_HEADERS = new Set([
-  "authorization",
-  "cookie",
-  "proxy-authorization",
-  "set-cookie",
-]);
-const FORBIDDEN_REPLAY_HEADERS = new Set([
-  "content-length",
-  "location",
-  "transfer-encoding",
-]);
-
-const validateRequestReplay = (
+/** Request steps stay on the start origin and send a body only with methods that carry one. */
+const validateRequestSteps = (
   scenario: ScenarioShape,
-  allowedOrigins: ReadonlySet<string>,
   context: z.RefinementCtx,
-): readonly string[] => {
-  if (scenario.request_replay.mode === "disabled") return [];
-  assertUnique(
-    scenario.request_replay.routes.map(({ route_id: id }) => id),
-    ["request_replay", "routes"],
-    "Replay route IDs",
-    context,
-  );
-  assertUnique(
-    scenario.request_replay.routes.map(
-      ({ method, request }) =>
-        `${method} ${request.url}?${request.query
-          .map(({ name, value }) =>
-            value.source === "secret"
-              ? `${name}=\${secret:${value.secret_id}}`
-              : `${name}=${value.value}`,
-          )
-          .join("&")}`,
-    ),
-    ["request_replay", "routes"],
-    "Replay request matchers",
-    context,
-  );
-  const references: string[] = [];
-  scenario.request_replay.routes.forEach((route, routeIndex) => {
-    assertAllowedDestination(
-      route.request,
-      allowedOrigins,
-      ["request_replay", "routes", routeIndex, "request"],
-      context,
-    );
-    references.push(...destinationSecretReferences(route.request));
-    if (route.response.kind === "redirect") {
-      assertAllowedDestination(
-        route.response.destination,
-        allowedOrigins,
-        ["request_replay", "routes", routeIndex, "response", "destination"],
+): void => {
+  const origin = new URL(scenario.start_url.url).origin;
+  scenario.actions.forEach((action, index) => {
+    if (action.action !== "request") return;
+    const resolved = URL.parse(action.path, origin);
+    if (resolved === null)
+      addIssue(
         context,
+        ["actions", index, "path"],
+        "The request step path is not a URL path the browser can resolve",
       );
-      references.push(
-        ...destinationSecretReferences(route.response.destination),
+    else if (resolved.origin !== origin)
+      addIssue(
+        context,
+        ["actions", index, "path"],
+        `Request steps must stay on the start URL's origin ${origin}`,
       );
-      return;
-    }
-    assertUnique(
-      route.response.headers.map(({ name }) => name.toLowerCase()),
-      ["request_replay", "routes", routeIndex, "response", "headers"],
-      "Replay response header names",
-      context,
-    );
-    route.response.headers.forEach((header, headerIndex) => {
-      if (FORBIDDEN_REPLAY_HEADERS.has(header.name))
+    if (
+      action.json !== undefined &&
+      (action.method === "GET" || action.method === "HEAD")
+    )
+      addIssue(
+        context,
+        ["actions", index, "json"],
+        `A ${action.method} request step cannot send a body`,
+      );
+    const names = new Set<string>();
+    action.headers.forEach((header, position) => {
+      const name = header.name.toLowerCase();
+      if (names.has(name))
         addIssue(
           context,
-          [
-            "request_replay",
-            "routes",
-            routeIndex,
-            "response",
-            "headers",
-            headerIndex,
-          ],
-          `Replay header ${header.name} must be modeled by the provider`,
+          ["actions", index, "headers", position, "name"],
+          `Request step headers name ${header.name} more than once`,
         );
+      names.add(name);
       if (
-        SENSITIVE_HEADERS.has(header.name) &&
-        header.value.source === "literal"
+        header.value.source === "literal" &&
+        !HEADER_FIELD_VALUE.test(header.value.value)
       )
         addIssue(
           context,
-          [
-            "request_replay",
-            "routes",
-            routeIndex,
-            "response",
-            "headers",
-            headerIndex,
-            "value",
-          ],
-          `Credential header ${header.name} requires a declared secret`,
+          ["actions", index, "headers", position, "value", "value"],
+          "A header value cannot carry line breaks or control characters",
         );
-      references.push(...secretReferencesInValue(header.value));
+      const username =
+        header.value.source === "basic_credentials"
+          ? header.value.parts[0]
+          : undefined;
+      if (
+        username?.source === "literal" &&
+        !validBasicCredentialUsername(username.value)
+      )
+        addIssue(
+          context,
+          ["actions", index, "headers", position, "value", "parts", 0, "value"],
+          "A Basic username cannot contain a colon, which separates the username from the password",
+        );
+      // Evidence records literals as written, so a password must come from a reference.
+      const password =
+        header.value.source === "basic_credentials"
+          ? header.value.parts[1]
+          : undefined;
+      if (password?.source === "literal" && password.value !== "")
+        addIssue(
+          context,
+          ["actions", index, "headers", position, "value", "parts", 1],
+          "Basic credentials take their password from a declared secret, a saved value, a cookie or local storage, not a literal",
+        );
     });
-    references.push(...secretReferencesInValue(route.response.body));
   });
-  return references;
 };
+
+function* storageSecretReferences(scenario: ScenarioShape): Generator<string> {
+  for (const cookie of scenario.storage.cookies) {
+    yield* secretReferencesInValue(cookie.value);
+    yield* destinationSecretReferences(cookie.destination);
+  }
+  for (const collection of ["local_storage", "session_storage"] as const)
+    for (const storage of scenario.storage[collection])
+      for (const entry of storage.entries)
+        yield* secretReferencesInValue(entry.value);
+}
 
 const validateSecretReferences = (
   scenario: ScenarioShape,
-  references: readonly string[],
+  references: ReadonlySet<string>,
   context: z.RefinementCtx,
 ): void => {
   const declared = new Set(scenario.secrets.map(({ secret_id: id }) => id));
@@ -253,63 +247,27 @@ const validateSecretReferences = (
         ["secrets"],
         `Secret reference ${reference} is not declared`,
       );
-  const used = new Set(references);
-  scenario.secrets.forEach(({ secret_id: id }, index) => {
-    if (!used.has(id))
-      addIssue(
-        context,
-        ["secrets", index, "secret_id"],
-        `Secret declaration ${id} is unused`,
-      );
-  });
-};
-
-const validateRedactionCoverage = (
-  scenario: ScenarioShape,
-  context: z.RefinementCtx,
-): void => {
-  const redactedQueries = new Set(scenario.redaction.query_parameter_names);
-  const destinations: BrowserScenarioUrl[] = [scenario.start_url];
-  for (const action of scenario.actions)
-    if (action.action === "goto") destinations.push(action.destination);
-  for (const cookie of scenario.storage.cookies)
-    destinations.push(cookie.destination);
-  if (scenario.request_replay.mode === "exact")
-    for (const route of scenario.request_replay.routes) {
-      destinations.push(route.request);
-      if (route.response.kind === "redirect")
-        destinations.push(route.response.destination);
-    }
-  for (const destination of destinations)
-    for (const query of destination.query)
-      if (
-        query.value.source === "secret" &&
-        !redactedQueries.has(query.name.toLowerCase())
-      )
-        addIssue(
-          context,
-          ["redaction", "query_parameter_names"],
-          `Secret query parameter ${query.name} must be declared for redaction`,
-        );
 };
 
 const validateBrowserScenario = (
   scenario: ScenarioShape,
   context: z.RefinementCtx,
 ): void => {
-  const allowedOrigins = new Set(scenario.allowed_origins);
-  assertAllowedDestination(
-    scenario.start_url,
-    allowedOrigins,
-    ["start_url"],
-    context,
-  );
   assertUnique(
     scenario.actions.map(({ step_id: id }) => id),
     ["actions"],
     "Action step IDs",
     context,
   );
+  const reservedIndex = scenario.actions.findIndex(
+    ({ step_id: id }) => id === BROWSER_SCENARIO_START_STEP_ID,
+  );
+  if (reservedIndex !== -1)
+    addIssue(
+      context,
+      ["actions", reservedIndex, "step_id"],
+      "Action step IDs must not reuse the reserved initial step identity",
+    );
   assertUnique(
     scenario.secrets.map(({ secret_id: id }) => id),
     ["secrets"],
@@ -323,20 +281,15 @@ const validateBrowserScenario = (
     context,
   );
 
-  const references = scenario.actions.flatMap(actionSecretReferences);
-  for (const [index, action] of scenario.actions.entries())
-    if (action.action === "goto")
-      assertAllowedDestination(
-        action.destination,
-        allowedOrigins,
-        ["actions", index, "destination"],
-        context,
-      );
-  references.push(...destinationSecretReferences(scenario.start_url));
-  references.push(...validateStorage(scenario, allowedOrigins, context));
-  references.push(...validateRequestReplay(scenario, allowedOrigins, context));
+  validateRequestSteps(scenario, context);
+  validateSavedValues(scenario, context);
+  // Reference identity is global; source uses remain in the parsed scenario.
+  const references = new Set(scenario.actions.flatMap(actionSecretReferences));
+  for (const reference of destinationSecretReferences(scenario.start_url))
+    references.add(reference);
+  for (const reference of storageSecretReferences(scenario))
+    references.add(reference);
   validateSecretReferences(scenario, references, context);
-  validateRedactionCoverage(scenario, context);
 };
 
 /** Strict provider-neutral contract for one controlled browser scenario. */

@@ -1,52 +1,31 @@
 import { createHash } from "node:crypto";
-import { access, readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 
 import { createGhidraTargetSnapshot } from "../../../../src/ghidra/GhidraTargetSnapshot.js";
 
-const roots: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(
-    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
-  );
-});
-
 describe("Ghidra target snapshot", () => {
-  it("copies an exact digest-bound target into the private runtime", async () => {
-    const root = await createTestTempDirectory("rea-ghidra-snapshot-");
-    roots.push(root);
+  it("uses the selected installation platform instead of the ambient host", async () => {
+    const root = await createTestTempDirectory("rea-ghidra-platform-");
     const source = join(root, "source.exe");
-    const bytes = Buffer.from("native PE fixture");
+    const bytes = Buffer.from("platform fixture");
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     await writeFile(source, bytes);
-
-    const snapshot = await createGhidraTargetSnapshot(source, root, sha256);
-
-    expect(snapshot).toEqual({
-      path: join(root, `target-${sha256.slice(0, 12)}.exe`),
-      sha256,
+    const snapshot = await createGhidraTargetSnapshot(source, root, sha256, {
+      platform: "linux",
     });
-    await expect(readFile(snapshot.path)).resolves.toEqual(bytes);
-  });
-
-  it("removes a snapshot whose digest differs from admission", async () => {
-    const root = await createTestTempDirectory("rea-ghidra-snapshot-");
-    roots.push(root);
-    const source = join(root, "source with unsafe extension.%PATH%");
-    await writeFile(source, "changed target");
-    const expected = "a".repeat(64);
-    const snapshotPath = join(root, `target-${expected.slice(0, 12)}.bin`);
-
+    expect(snapshot.admission).toBeUndefined();
+    expect(Buffer.compare(await readFile(snapshot.path), bytes)).toBe(0);
     await expect(
-      createGhidraTargetSnapshot(source, root, expected),
-    ).rejects.toThrow(/digest mismatch/u);
-    await expect(access(snapshotPath)).rejects.toMatchObject({
-      code: "ENOENT",
-    });
+      createGhidraTargetSnapshot(source, root, sha256, { platform: "linux" }),
+    ).rejects.toMatchObject({ code: "EEXIST" });
+    expect(Buffer.compare(await readFile(snapshot.path), bytes)).toBe(0);
+    await expect(
+      createGhidraTargetSnapshot(source, root, sha256, { platform: "win32" }),
+    ).rejects.toThrow(/No native private runtime owns/u);
   });
 });

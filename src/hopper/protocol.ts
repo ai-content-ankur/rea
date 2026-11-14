@@ -1,12 +1,16 @@
 import { z } from "zod";
 
-import { HopperProtocolError, HopperRemoteError } from "../domain/errors.js";
-import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
+import {
+  HopperProtocolError,
+  HopperRemoteError,
+} from "../domain/hopperErrors.js";
+import { ownedJsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { safeParseJson } from "../domain/safeJson.js";
 
 const remoteErrorSchema = z
   .object({
-    code: z.number().int(),
+    code: z.int(),
     message: z.string(),
     type: z
       .enum([
@@ -23,13 +27,13 @@ const remoteErrorSchema = z
 const responseSchema = z.union([
   z
     .object({
-      id: z.number().int().nonnegative(),
-      result: jsonValueSchema,
+      id: z.int().nonnegative(),
+      result: ownedJsonValueSchema,
     })
     .strict(),
   z
     .object({
-      id: z.number().int().nonnegative(),
+      id: z.int().nonnegative(),
       error: remoteErrorSchema,
     })
     .strict(),
@@ -37,7 +41,7 @@ const responseSchema = z.union([
 
 const eventSchema = z
   .object({
-    id: z.number().int().nonnegative(),
+    id: z.int().nonnegative(),
     event: z.discriminatedUnion("type", [
       z
         .object({
@@ -82,14 +86,14 @@ export type HopperBridgeMessage = z.infer<typeof messageSchema>;
 export const parseBridgeMessageLine = (
   line: string,
 ): Result<HopperBridgeMessage, HopperProtocolError> => {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(line);
-  } catch (cause: unknown) {
+  const decodedResult = safeParseJson(line);
+  if (!decodedResult.ok)
     return err(
-      new HopperProtocolError("Hopper returned malformed JSON", { cause }),
+      new HopperProtocolError("Hopper returned malformed JSON", {
+        cause: decodedResult.cause,
+      }),
     );
-  }
+  const decoded: unknown = decodedResult.value;
 
   const parsed = messageSchema.safeParse(decoded);
   return parsed.success

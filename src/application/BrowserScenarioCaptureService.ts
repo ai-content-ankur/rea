@@ -1,74 +1,32 @@
-import { projectPermissionFailure } from "./PermissionFailure.js";
 import type { ExecutionOptions } from "./AnalysisProvider.js";
 import type { BrowserScenarioCapturePort } from "./BrowserScenarioCapturePort.js";
 import { createBrowserScenarioEvidence } from "./BrowserScenarioEvidence.js";
-import type { PermissionAuthority } from "./PermissionAuthority.js";
-import { digestJson } from "./JavaScriptReplayPlanning.js";
 import {
+  AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
-  type AnalysisError,
-} from "../domain/errors.js";
+  AnalysisOutputError,
+} from "../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { Evidence } from "../domain/evidence.js";
-import { isLiteralLoopbackHostname } from "../domain/browserObservation.js";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import { err, type Result } from "../domain/result.js";
+import { browserScenarioCaptureSchema } from "../domain/browserScenarioCapture.js";
+import {
+  completeProviderEvidence,
+  keepIncompleteObservation,
+} from "./ProviderOperationExecution.js";
+
+import { jsonValueSchema } from "../domain/jsonValue.js";
 
 const OPERATION = "capture_browser_scenario" as const;
 const PROVIDER_ID = "rea-playwright-browser-scenario";
 
-const networkScope = (origins: readonly string[]): "loopback" | "external" =>
-  origins.every((origin) => isLiteralLoopbackHostname(new URL(origin).hostname))
-    ? "loopback"
-    : "external";
-
-const authorizeScenario = async (
-  authority: PermissionAuthority | undefined,
-  scenario: BrowserScenario,
-): Promise<Result<true, AnalysisError>> => {
-  if (authority === undefined)
-    return err(
-      new AnalysisCapabilityUnavailableError(
-        PROVIDER_ID,
-        OPERATION,
-        "browser scenario permission policy is not configured",
-      ),
-    );
-  const authorized = await authority.authorize(
-    {
-      capability: "browser_automate",
-      roots: [],
-      executables:
-        scenario.browser.mode === "launch"
-          ? [scenario.browser.executable_path]
-          : [],
-      environment_names: scenario.secrets.map(
-        ({ environment_variable: name }) => name,
-      ),
-      origins: [
-        ...(scenario.browser.mode === "connect"
-          ? [scenario.browser.cdp_endpoint]
-          : []),
-        ...scenario.allowed_origins,
-      ],
-      network: networkScope(scenario.allowed_origins),
-      mount: false,
-      operation_identity: `${OPERATION}:${digestJson(scenario)}`,
-    },
-    "write",
-  );
-  if (!authorized.ok) return err(projectPermissionFailure(authorized.error));
-  return { ok: true, value: true };
-};
-
-/** Authorize and execute one controlled browser scenario. */
+/** Execute one controlled browser scenario using its explicit request scope. */
 export const captureBrowserScenario = async (
   provider: BrowserScenarioCapturePort | undefined,
-  authority: PermissionAuthority | undefined,
   scenario: BrowserScenario,
   options: ExecutionOptions = {},
 ): Promise<Result<Evidence, AnalysisError>> => {
-  const authorized = await authorizeScenario(authority, scenario);
-  if (!authorized.ok) return authorized;
   if (provider === undefined)
     return err(
       new AnalysisCapabilityUnavailableError(
@@ -77,15 +35,76 @@ export const captureBrowserScenario = async (
         "browser scenario provider is not configured",
       ),
     );
+  if (options.signal?.aborted)
+    return err(
+      new AnalysisCancelledError(OPERATION, { cause: options.signal.reason }),
+    );
   const captured = await provider.captureScenario(scenario, options);
-  return captured.ok
-    ? {
-        ok: true,
-        value: createBrowserScenarioEvidence(
-          scenario,
-          captured.value,
-          provider.identity(),
-        ),
+  if (!captured.ok) {
+    keepIncompleteObservation(
+      captured.error,
+      OPERATION,
+      "Browser scenario provider retained a non-JSON incomplete observation.",
+    );
+    const seen = new Set<AnalysisError>();
+    const promoted = new Map<object, Evidence>();
+    let owner: AnalysisError | undefined = captured.error;
+    while (owner !== undefined && !seen.has(owner)) {
+      seen.add(owner);
+      const partial = owner.partialObservation;
+      if (
+        partial !== undefined &&
+        "kind" in partial &&
+        partial.kind === "browser-scenario-observation"
+      ) {
+        const report = browserScenarioCaptureSchema.safeParse(partial.capture);
+        // Every cleanup primary may become the selected error after release.
+        if (
+          report.success &&
+          report.data.steps.every(({ status }) => status === "completed")
+        ) {
+          const evidence =
+            promoted.get(partial) ??
+            createBrowserScenarioEvidence(
+              scenario,
+              {
+                source: jsonValueSchema.parse(partial.capture),
+                facts: report.data,
+              },
+              provider.identity(),
+            );
+          promoted.set(partial, evidence);
+          owner.partialObservation = evidence;
+        }
       }
-    : captured;
+      owner = owner.cleanupPrimary;
+    }
+    return captured;
+  }
+  const json = jsonValueSchema.safeParse(captured.value);
+  if (!json.success)
+    return err(
+      new AnalysisOutputError(
+        OPERATION,
+        "Browser scenario provider returned non-JSON capture data.",
+        { cause: json.error },
+      ),
+    );
+  const report = browserScenarioCaptureSchema.safeParse(json.data);
+  if (!report.success)
+    return err(
+      new AnalysisOutputError(
+        OPERATION,
+        "Browser scenario provider returned a malformed completed capture.",
+        { cause: report.error },
+      ),
+    );
+  return completeProviderEvidence(
+    createBrowserScenarioEvidence(
+      scenario,
+      { source: json.data, facts: report.data },
+      provider.identity(),
+    ),
+    options.signal,
+  );
 };

@@ -1,39 +1,21 @@
 import * as t from "@babel/types";
 
 import { sanitizeBrowserUrl } from "./browserObservation.js";
+import { hasScheme } from "./artifactPathSyntax.js";
+import {
+  isNullishJavaScriptSyntax,
+  readExactJavaScriptLiteral,
+  staticObjectProperty,
+  type ObjectDataPropertyValue,
+} from "./javascript/javascriptAstValues.js";
 
-/** Name of a call/new callee from its AST node. */
-export const calleeName = (callee: t.Node): string => {
-  if (t.isIdentifier(callee)) return callee.name;
-  if (t.isImport(callee)) return "import";
-  if (t.isMemberExpression(callee) || t.isOptionalMemberExpression(callee)) {
-    const object = t.isExpression(callee.object)
-      ? calleeName(callee.object)
-      : "";
-    const property = propertyName(callee.property);
-    return object === "" ? property : `${object}.${property}`;
-  }
-  return "";
-};
-
-export const stringArgument = (
-  value: t.Node | null | undefined,
-): string | undefined => (t.isStringLiteral(value) ? value.value : undefined);
-
-export const propertyName = (value: t.Node): string => {
-  if (t.isIdentifier(value)) return value.name;
-  if (t.isStringLiteral(value)) return value.value;
-  return "";
-};
-
+/** Read a statically known own property value from an object expression. */
 export const objectValue = (
   object: t.ObjectExpression,
   name: string,
-): t.ObjectProperty["value"] | undefined => {
-  for (const property of object.properties)
-    if (t.isObjectProperty(property) && propertyName(property.key) === name)
-      return property.value;
-  return undefined;
+): ObjectDataPropertyValue | undefined => {
+  const result = staticObjectProperty(object, name, isNullishJavaScriptSyntax);
+  return result.status === "explicit" ? result.value : undefined;
 };
 
 export const objectString = (
@@ -41,8 +23,19 @@ export const objectString = (
   name: string,
 ): string | undefined => {
   const value = objectValue(object, name);
-  return t.isStringLiteral(value) ? value.value : undefined;
+  if (value === undefined) return undefined;
+  const literal = readExactJavaScriptLiteral(value);
+  return literal.found && typeof literal.value === "string"
+    ? literal.value
+    : undefined;
 };
+
+/** Whether module syntax supplies a URL location without a package/import-map resolver. */
+export const isUrlLikeModuleSpecifier = (specifier: string): boolean =>
+  specifier.startsWith("/") ||
+  specifier.startsWith("./") ||
+  specifier.startsWith("../") ||
+  hasScheme(specifier);
 
 export const resolveSpecifier = (
   specifier: string,
@@ -53,7 +46,9 @@ export const resolveSpecifier = (
     if (resolved.protocol !== "http:" && resolved.protocol !== "https:")
       return null;
     return sanitizeBrowserUrl(resolved.href).url;
-  } catch {
+  } catch (cause: unknown) {
+    // Unresolvable specifiers are represented by the null return.
+    void cause;
     return null;
   }
 };
@@ -67,26 +62,3 @@ export const locationFields = (node: t.Node) => ({
   line: node.loc?.start.line ?? null,
   column: node.loc?.start.column ?? null,
 });
-
-/** Pick the endpoint argument for common network-call patterns. */
-export const endpointArgument = (
-  name: string,
-  args: readonly (
-    | t.Expression
-    | t.SpreadElement
-    | t.JSXNamespacedName
-    | t.ArgumentPlaceholder
-  )[],
-): string | undefined => {
-  if (name === "fetch" || name.endsWith(".fetch") || name === "WebSocket")
-    return stringArgument(args[0]);
-  if (name.endsWith(".open") && stringArgument(args[1]) !== undefined)
-    return stringArgument(args[1]);
-  if (
-    ["get", "post", "put", "patch", "delete", "request"].some(
-      (method) => name === method || name.endsWith(`.${method}`),
-    )
-  )
-    return stringArgument(args[0]);
-  return undefined;
-};

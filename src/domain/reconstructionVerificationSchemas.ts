@@ -1,9 +1,13 @@
 import { z } from "zod";
 
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
-const unknownIdSchema = z.string().regex(/^unk_[a-f0-9]{64}$/u);
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
-const claimIdSchema = z.string().regex(/^[A-Za-z][A-Za-z0-9._-]*$/u);
+import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
+import { digestSchema, prefixedDigestSchema } from "./../domain/digests.js";
+import { PROCESS_COMPARISON_DIMENSIONS } from "./process/processComparison.js";
+import { functionComparisonDimensionNameSchema } from "./functionComparisonSchemas.js";
+
+const evidenceIdSchema = prefixedDigestSchema("ev");
+const unknownIdSchema = prefixedDigestSchema("unk");
+const claimIdSchema = z.string().regex(IDENTIFIER_PATTERN);
 const titleSchema = z.string().trim().min(1);
 const verificationStatusSchema = z.enum(["pass", "fail", "unknown"]);
 const commonClaim = {
@@ -15,30 +19,14 @@ const commonClaim = {
 const behavioralClaimSchema = z.object({
   ...commonClaim,
   kind: z.literal("behavioral"),
-  dimension: z.enum([
-    "overall",
-    "terminal",
-    "interaction",
-    "exit",
-    "filesystem",
-    "protocol",
-    "process",
-    "shim",
-  ]),
+  dimension: z.enum(["overall", ...PROCESS_COMPARISON_DIMENSIONS]),
 });
 const functionClaimSchema = z.object({
   ...commonClaim,
   kind: z.literal("structural-function"),
   dimension: z.enum([
     "overall",
-    "identity",
-    "pseudocode",
-    "assembly",
-    "comments",
-    "calls",
-    "references",
-    "strings_names",
-    "cfg",
+    ...functionComparisonDimensionNameSchema.options,
   ]),
 });
 const artifactClaimSchema = z.object({
@@ -96,7 +84,7 @@ export const reconstructionClaimResultSchema = z.object({
   comparison_evidence_id: evidenceIdSchema,
   left_evidence_ids: z.array(evidenceIdSchema).min(1),
   right_evidence_ids: z.array(evidenceIdSchema).min(1),
-  evidence_links: z.array(evidenceIdSchema).min(3),
+  evidence_links: z.array(evidenceIdSchema).min(2),
   unknown_ids: z.array(unknownIdSchema),
   limitations: z.array(z.string()),
 });
@@ -107,12 +95,12 @@ export const reconstructionVerificationResultSchema = z
     status: verificationStatusSchema,
     specification_sha256: digestSchema,
     summary: z.object({
-      total: z.number().int().min(1),
-      passed: z.number().int().min(0),
-      failed: z.number().int().min(0),
-      unknown: z.number().int().min(0),
-      behavioral: z.number().int().min(0),
-      structural: z.number().int().min(0),
+      total: z.int().min(1),
+      passed: z.int().min(0),
+      failed: z.int().min(0),
+      unknown: z.int().min(0),
+      behavioral: z.int().min(0),
+      structural: z.int().min(0),
     }),
     claims: z.object({
       items: z.array(reconstructionClaimResultSchema),
@@ -125,14 +113,33 @@ export const reconstructionVerificationResultSchema = z
         unknown_ids: z.array(unknownIdSchema),
       }),
     ),
-    evidence_links: z.array(evidenceIdSchema).min(3),
+    evidence_links: z.array(evidenceIdSchema).min(2),
     limitations: z.array(z.string()),
   })
   .superRefine((result, context) => {
     const { summary } = result;
+    const claims = result.claims.items;
     const expectedStatus =
       summary.failed > 0 ? "fail" : summary.unknown > 0 ? "unknown" : "pass";
     const issues = [
+      [
+        summary.passed !==
+          claims.filter(({ status }) => status === "pass").length ||
+          summary.failed !==
+            claims.filter(({ status }) => status === "fail").length ||
+          summary.unknown !==
+            claims.filter(({ status }) => status === "unknown").length,
+        "Claim status counts must summarize retained claims",
+        ["summary"],
+      ],
+      [
+        summary.behavioral !==
+          claims.filter(({ kind }) => kind === "behavioral").length ||
+          summary.structural !==
+            claims.filter(({ kind }) => kind !== "behavioral").length,
+        "Claim kind counts must summarize retained claims",
+        ["summary"],
+      ],
       [
         summary.total !== summary.passed + summary.failed + summary.unknown,
         "Claim status counts must equal the summary total",

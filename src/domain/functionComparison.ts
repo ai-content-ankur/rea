@@ -1,33 +1,35 @@
-import { parseFunctionEvidence } from "./functionDossierEvidence.js";
+import { canonicalJson } from "./comparisonSemantics.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
+import {
+  functionSnapshotCoordinateContext,
+  type FunctionSnapshot,
+} from "./functionDossierEvidence.js";
 import { functionMatch } from "./functionComparisonNormalization.js";
 import {
   functionComparisonResultSchema,
   type FunctionComparisonResult,
 } from "./functionComparisonSchemas.js";
-import {
-  overallStatus,
-  summarize,
-  canonicalJson,
-} from "./functionComparisonResults.js";
+import { overallStatus, summarize } from "./functionComparisonResults.js";
 import { compareDimensions } from "./functionComparisonDimensions.js";
 
-export {
-  functionComparisonInputSchema,
-  functionComparisonResultSchema,
-} from "./functionComparisonSchemas.js";
-
-/** Compare two complete function Evidence records without fuzzy matching. */
+/** Compare two authenticated function snapshots without fuzzy matching. */
 export const compareFunctions = (
-  leftInput: unknown,
-  rightInput: unknown,
+  left: FunctionSnapshot,
+  right: FunctionSnapshot,
 ): FunctionComparisonResult => {
-  const left = parseFunctionEvidence(leftInput);
-  const right = parseFunctionEvidence(rightInput);
-  const links = [left.evidence[0].evidence_id, right.evidence[0].evidence_id];
+  const links = [left.evidence.evidence_id, right.evidence.evidence_id];
   const providersDiffer =
-    canonicalJson(left.provider) !== canonicalJson(right.provider);
-  const dimensions = compareDimensions(left, right, links, providersDiffer);
-  const match = functionMatch(left, right);
+    canonicalJson(left.evidence.provider, "Function comparison") !==
+    canonicalJson(right.evidence.provider, "Function comparison");
+  const coordinateContext = functionSnapshotCoordinateContext(left, right);
+  const match = functionMatch(left, right, coordinateContext);
+  const dimensions = compareDimensions(left, right, {
+    links,
+    providersDiffer,
+    sameIdentity:
+      match.method === "same-entry" || match.method === "same-evidence",
+    coordinateContext,
+  });
   const changes = dimensions.filter(({ status }) => status !== "unchanged");
   return functionComparisonResultSchema.parse({
     status: overallStatus(dimensions, match.status),
@@ -47,6 +49,6 @@ export const compareFunctions = (
             ]
           : []),
       ]),
-    ].sort((a, b) => a.localeCompare(b)),
+    ].sort((a, b) => compareUnicodeCodePoints(a, b)),
   });
 };

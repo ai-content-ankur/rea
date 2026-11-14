@@ -1,8 +1,12 @@
 import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { OFFICIAL_TOOL_CONTRACTS } from "../../../../src/contracts/officialToolContracts.js";
+import { nativeSymbolMetadataSchema } from "../../../../src/domain/native/nativeSymbol.js";
+import { functionDossierSchema } from "../../../../src/domain/native/functionDossier.js";
 
 const execute = promisify(execFile);
 const bridgePath = new URL(
@@ -21,15 +25,51 @@ const probeResultSchema = z.strictObject({
   }),
   current_document: z.literal("fixture"),
   current_address: z.literal("0x401000"),
-  strings: z.strictObject({ "0x401234": z.literal("fixture string") }),
-  inventory_replies: z.array(
-    z.strictObject({
-      id: z.number().int(),
-      result: z.array(
-        z.strictObject({ address: z.string(), value: z.string() }),
-      ),
+  containing_procedure: z.strictObject({
+    query_address: z.literal("0x401000"),
+    found: z.literal(true),
+    procedure: z.strictObject({
+      address: z.literal("0x401000"),
+      name: z.literal("fixture-procedure"),
+      symbol: nativeSymbolMetadataSchema.nullable(),
+      classification: z.null(),
+      body: z.strictObject({
+        available: z.literal(false),
+        reason: z.string(),
+      }),
     }),
-  ),
+  }),
+  procedure_info: z.strictObject({
+    name: z.literal("fixture-procedure"),
+    entrypoint: z.literal("0x401000"),
+    basicblock_count: z.literal(1),
+    length: z.number(),
+    signature: z.literal("int fixture-procedure()"),
+    locals: z.array(z.unknown()),
+    symbol: nativeSymbolMetadataSchema.nullable(),
+    classification: z.null(),
+    body: z.strictObject({
+      available: z.literal(false),
+      reason: z.string(),
+    }),
+  }),
+  analyze_function: z.unknown(),
+  procedure_references: z.strictObject({
+    procedure: z.strictObject({
+      address: z.literal("0x401000"),
+      name: z.literal("fixture-procedure"),
+      symbol: nativeSymbolMetadataSchema.nullable(),
+      classification: z.null(),
+      body: z.strictObject({
+        available: z.literal(false),
+        reason: z.string(),
+      }),
+    }),
+    direction: z.literal("outgoing"),
+    reference_kinds_available: z.literal(false),
+    unresolved_calls: z.array(z.unknown()),
+    references: z.array(z.unknown()),
+  }),
   provider_faults: z.array(
     z.strictObject({
       id: z.literal(1),
@@ -88,7 +128,7 @@ const probeResultSchema = z.strictObject({
     id: z.literal(0),
     error: z.strictObject({
       code: z.literal(-32000),
-      message: z.literal("Invalid Hopper bridge request"),
+      message: z.literal("Invalid bridge request id"),
       type: z.literal("invalid_request"),
     }),
   }),
@@ -98,7 +138,7 @@ describe("Hopper API facade", () => {
   it("imports without Hopper globals and gates exhaustive work during analysis", async () => {
     const { stdout } = await execute(
       "python3",
-      [probePath.pathname, bridgePath.pathname],
+      [fileURLToPath(probePath), fileURLToPath(bridgePath)],
       {
         encoding: "utf8",
         timeout: 3_000,
@@ -106,18 +146,72 @@ describe("Hopper API facade", () => {
       },
     );
     const result = probeResultSchema.parse(JSON.parse(stdout));
+    for (const [name, value] of [
+      ["resolve_containing_procedure", result.containing_procedure],
+      ["procedure_references", result.procedure_references],
+      ["procedure_info", result.procedure_info],
+    ] as const) {
+      const contract = OFFICIAL_TOOL_CONTRACTS.find(
+        (candidate) => candidate.name === name,
+      );
+      if (contract === undefined) throw new Error(`missing ${name} contract`);
+      const parsed =
+        contract.outputSchema.shape.normalized_result.safeParse(value);
+      if (!parsed.success) throw new Error(`${name}: ${parsed.error.message}`);
+      expect(parsed.success, name).toBe(true);
+    }
+    const dossier = functionDossierSchema.parse(result.analyze_function);
+    expect(dossier).toMatchObject({
+      procedure: {
+        classification: null,
+        body: {
+          available: false,
+          reason: expect.stringMatching(
+            /Hopper.*Python API.*does not expose complete function body ranges/i,
+          ),
+        },
+      },
+      native_api: null,
+      native_value_flow: null,
+      facet_availability: {
+        pseudocode: {
+          available: false,
+          reason: "Hopper did not supply pseudocode.",
+        },
+        assembly: { available: true },
+        comments: { available: true },
+        callers: { available: true },
+        callees: { available: true },
+        references: { available: true },
+        strings_names: { available: true },
+        cfg: { available: true },
+      },
+    });
     expect(result.provider_faults.map((reply) => reply.error.message)).toEqual([
       "TypeError: Hopper bridge operation failed",
       "ValueError: Hopper bridge operation failed",
       "KeyError: Hopper bridge operation failed",
     ]);
     expect(result.malformed_requests).toEqual([
-      ...[0, 0, 0, 0, 0, 2, 3, 0, 4, 5, 6, 7].map((id) => ({
+      ...[
+        [0, "Invalid bridge request JSON"],
+        [0, "Invalid bridge request JSON"],
+        [0, "Invalid bridge request shape"],
+        [0, "Invalid bridge request shape"],
+        [0, "Invalid bridge request shape"],
+        [2, "Invalid bridge method or parameters"],
+        [3, "Invalid bridge method or parameters"],
+        [0, "Invalid bridge request id"],
+        [4, "Address must be a string"],
+        [5, "Byte-read length must be an integer"],
+        [6, "case_sensitive must be a boolean"],
+        [7, "Unknown bridge method"],
+      ].map(([id, message]) => ({
         id,
         error: {
           code: -32000,
           type: "invalid_request",
-          message: "Invalid Hopper bridge request",
+          message,
         },
       })),
       {
@@ -129,28 +223,6 @@ describe("Hopper API facade", () => {
         },
       },
       { id: 9, result: "0x401000" },
-    ]);
-    expect(result.inventory_replies).toEqual([
-      {
-        id: 1,
-        result: [
-          { address: "0x2", value: "string-2" },
-          { address: "0x10", value: "string-16" },
-          { address: "0x100", value: "string-256" },
-        ],
-      },
-      {
-        id: 2,
-        result: [
-          { address: "0x2", value: "name-2" },
-          { address: "0x10", value: "name-16" },
-          { address: "0x100", value: "name-256" },
-        ],
-      },
-      { id: 3, result: [{ address: "0x10", value: "string-16" }] },
-      { id: 4, result: [{ address: "0x10", value: "name-16" }] },
-      { id: 5, result: [] },
-      { id: 6, result: [] },
     ]);
     expect(stdout).not.toContain("supersecret");
     expect(result.analysis_guard.message).toContain(

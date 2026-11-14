@@ -5,6 +5,7 @@ import {
   bundleComparisonResultSchema,
   compareBundles,
 } from "./bundleComparison.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
 import { createEvidence } from "./evidence.js";
 import { createEvidenceBundle } from "./evidenceBundle.js";
 import {
@@ -23,6 +24,57 @@ const evidence = (label: string) =>
     confidence: "derived",
     authority: "analyst-inference",
   });
+
+describe("bundle comparison explicit cross-pairs", () => {
+  it("accounts for every unpaired occurrence after cross-pairing shared records", () => {
+    const first = evidence("first-cross-pair");
+    const second = evidence("second-cross-pair");
+    const unchanged = evidence("unchanged-cross-pair");
+    const bundle = createEvidenceBundle([first, second, unchanged]);
+    const result = compareBundles(bundle, bundle, [
+      {
+        left_evidence_id: first.evidence_id,
+        right_evidence_id: second.evidence_id,
+      },
+    ]);
+    expect(result.summary).toMatchObject({
+      records_unchanged: 1,
+      records_changed: 1,
+      records_added: 0,
+      records_removed: 0,
+      unresolved: 2,
+    });
+    expect(result.changes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          classification: "unknown",
+          conclusion_kind: "unresolved_branch",
+          left_evidence_ids: [second.evidence_id],
+        }),
+        expect.objectContaining({
+          classification: "unknown",
+          conclusion_kind: "unresolved_branch",
+          right_evidence_ids: [first.evidence_id],
+        }),
+      ]),
+    );
+    expect(result.status).toBe("unknown");
+    expect(result.changes).toHaveLength(3);
+    const changedOrUnknown = result.changes.filter(
+      ({ entity }) => entity === "evidence",
+    );
+    expect(
+      result.summary.records_unchanged +
+        changedOrUnknown.flatMap(({ left_evidence_ids }) => left_evidence_ids)
+          .length,
+    ).toBe(bundle.records.length);
+    expect(
+      result.summary.records_unchanged +
+        changedOrUnknown.flatMap(({ right_evidence_ids }) => right_evidence_ids)
+          .length,
+    ).toBe(bundle.records.length);
+  });
+});
 
 describe("bundle comparison", () => {
   it("accepts long caller-selected bundle paths", () => {
@@ -54,7 +106,7 @@ describe("bundle comparison", () => {
     expect(result.left_bundle_sha256).toBe(result.right_bundle_sha256);
   });
 
-  it("classifies explicit pairs and returns every membership change inline", () => {
+  it("classifies explicit pairs and leaves one-sided membership unresolved", () => {
     const oldRecord = evidence("old");
     const newRecord = evidence("new");
     const removed = evidence("removed");
@@ -71,19 +123,26 @@ describe("bundle comparison", () => {
     const repeated = compareBundles(left, right, pairs);
     expect(first).toEqual(repeated);
     expect(first).toMatchObject({
-      status: "changed",
+      status: "unknown",
       summary: {
-        records_added: 1,
-        records_removed: 1,
+        records_added: 0,
+        records_removed: 0,
         records_changed: 1,
+        unresolved: 2,
       },
       changes: expect.arrayContaining([
         expect.objectContaining({ classification: "changed" }),
+        expect.objectContaining({
+          classification: "unknown",
+          conclusion_kind: "unresolved_branch",
+        }),
       ]),
     });
     expect(first.changes).toHaveLength(3);
-    expect(first.limitations).toContain(
-      "One-sided membership proves only bundle inclusion or omission, not behavioral absence.",
+    expect(first.limitations).toContainEqual(
+      expect.stringMatching(
+        /no inventory completeness marker.*membership remains unknown/i,
+      ),
     );
   });
 
@@ -113,7 +172,7 @@ describe("bundle comparison", () => {
           right_evidence_id: rightRecord.evidence_id,
         },
       ]),
-    ).toThrow(/missing left evidence/u);
+    ).toThrow(AnalysisInputError);
     expect(() =>
       compareBundles(left, right, [
         {
@@ -125,7 +184,7 @@ describe("bundle comparison", () => {
           right_evidence_id: rightRecord.evidence_id,
         },
       ]),
-    ).toThrow(/one-to-one/u);
+    ).toThrow(AnalysisInputError);
     expect(() =>
       compareBundles({ ...left, records: [leftRecord, leftRecord] }, right),
     ).toThrow(/duplicate record IDs/u);
@@ -176,12 +235,12 @@ describe("bundle comparison history", () => {
       [initial, advanced],
     );
     expect(compareBundles(initialBundle, advancedBundle)).toMatchObject({
-      status: "changed",
-      summary: { unknowns_advanced: 1, unresolved: 0 },
+      status: "unknown",
+      summary: { unknowns_advanced: 1, unresolved: 1 },
       changes: [
         expect.objectContaining({
           entity: "evidence",
-          classification: "added",
+          classification: "unknown",
         }),
         expect.objectContaining({
           entity: "residual_unknown",
@@ -193,15 +252,21 @@ describe("bundle comparison history", () => {
     const missing = compareBundles(initialBundle, absent);
     expect(missing).toMatchObject({
       status: "unknown",
-      summary: { unknowns_removed: 1, unresolved: 1 },
+      summary: {
+        unknowns_added: 0,
+        unknowns_removed: 0,
+        unresolved: 2,
+      },
     });
     expect(missing.changes).toContainEqual(
       expect.objectContaining({
-        classification: "removed",
+        classification: "unknown",
         conclusion_kind: "unresolved_branch",
-        limitations: [
-          "A missing unknown history does not establish resolution.",
-        ],
+        limitations: expect.arrayContaining([
+          expect.stringMatching(
+            /no inventory completeness marker.*history membership remains unknown/i,
+          ),
+        ]),
       }),
     );
   });

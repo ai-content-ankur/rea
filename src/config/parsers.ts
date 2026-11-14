@@ -1,79 +1,56 @@
 import { z } from "zod";
-import { isAbsolute } from "node:path";
 
-import { ConfigurationError } from "../domain/errors.js";
+import { ConfigurationError } from "../domain/configurationErrors.js";
+import { nulFreeStringSchema } from "../domain/localPath.js";
 import { err, ok, type Result } from "../domain/result.js";
+import { safeParseJson } from "../domain/safeJson.js";
 
+/** Decode explicitly selected reference-source exclusion patterns. */
 export const parseStringArray = (
   encoded: string,
   name: string,
 ): Result<readonly string[], ConfigurationError> => {
-  try {
-    const parsed = z.array(z.string().min(1)).safeParse(JSON.parse(encoded));
-    return parsed.success
-      ? ok(parsed.data)
-      : err(
-          new ConfigurationError(`${name} must encode an array of strings`, {
-            cause: parsed.error,
-          }),
-        );
-  } catch (cause: unknown) {
-    return err(new ConfigurationError(`${name} must be valid JSON`, { cause }));
-  }
+  return parseConfiguredStringArray(encoded, name, z.string().min(1));
 };
 
-/** Parse a JSON string array whose members must all be absolute paths. */
-export const parseAbsoluteRoots = (
-  encoded: string,
-  name: string,
-): Result<readonly string[], ConfigurationError> => {
-  const parsed = parseStringArray(encoded, name);
-  if (!parsed.ok) return parsed;
-  return parsed.value.some((root) => !isAbsolute(root))
-    ? err(new ConfigurationError(`${name} must encode absolute roots`))
-    : parsed;
-};
-
-export const parseBrowserArray = (
-  encoded: string,
-  name: string,
-  itemSchema: z.ZodType<string>,
-): Result<readonly string[], ConfigurationError> => {
-  try {
-    const parsed = z.array(itemSchema).safeParse(JSON.parse(encoded));
-    return parsed.success
-      ? ok([...new Set(parsed.data)].sort())
-      : err(
-          new ConfigurationError(`${name} must encode valid browser scopes`, {
-            cause: parsed.error,
-          }),
-        );
-  } catch (cause: unknown) {
-    return err(new ConfigurationError(`${name} must be valid JSON`, { cause }));
-  }
-};
-
+/** Decode Hopper arguments while preserving meaningful empty argv entries. */
 export const parseLoaderArgs = (
   encoded: string | undefined,
 ): Result<readonly string[], ConfigurationError> => {
   if (encoded === undefined) return ok([]);
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(encoded);
-  } catch (cause: unknown) {
+  return parseConfiguredStringArray(
+    encoded,
+    "HOPPER_LOADER_ARGS_JSON",
+    nulFreeStringSchema,
+    "must encode an array of strings without NUL bytes",
+  );
+};
+
+const parseConfiguredStringArray = (
+  encoded: string,
+  setting: string,
+  itemSchema: z.ZodString,
+  requirement = "must encode an array of strings",
+): Result<readonly string[], ConfigurationError> => {
+  const decoded = safeParseJson(encoded);
+  if (!decoded.ok)
     return err(
-      new ConfigurationError("HOPPER_LOADER_ARGS_JSON must be valid JSON", {
-        cause,
-      }),
+      configuredArrayError(setting, "must be valid JSON", decoded.cause),
     );
-  }
-  const parsed = z.array(z.string()).safeParse(decoded);
+  const parsed = z.array(itemSchema).safeParse(decoded.value);
   return parsed.success
     ? ok(parsed.data)
-    : err(
-        new ConfigurationError(
-          "HOPPER_LOADER_ARGS_JSON must encode an array of strings",
-          { cause: parsed.error },
-        ),
-      );
+    : err(configuredArrayError(setting, requirement, parsed.error));
+};
+
+const configuredArrayError = (
+  setting: string,
+  requirement: string,
+  cause: unknown,
+): ConfigurationError => {
+  const constraint = `${setting} ${requirement}`;
+  return new ConfigurationError(constraint, {
+    cause,
+    settings: [{ setting, constraint }],
+  });
 };

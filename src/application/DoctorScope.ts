@@ -1,18 +1,27 @@
+import { uniqueSorted } from "../domain/canonicalOrdering.js";
+import { blocksProcessStart } from "../config/processStart.js";
 import type {
   ClientRegistrationStatus,
   UnhealthyClientRegistrationStatus,
 } from "./ClientRegistrationStatus.js";
+import { manualRegistrationRemediation } from "./SupportedClients.js";
+import { isDesktopBuildInformationalCheck } from "./DesktopBuildDoctor.js";
+import {
+  DESKTOP_BUILD_PROVIDER_ID,
+  isDesktopBuildCheck,
+} from "./DoctorProviderIds.js";
 import type {
   DoctorCheck,
   DoctorProviderInspection,
   DoctorScope,
+  DoctorSkillState,
 } from "./Doctor.js";
-import { doctorHealthy } from "./DoctorDiagnostics.js";
 
 /** Normalized readiness boundary included in every doctor response. */
 export interface DoctorScopeReport {
   readonly mode: "audit-wide" | "explicit";
   readonly clients: readonly string[];
+  readonly skill_clients?: readonly string[];
   readonly providers: readonly string[];
   readonly skill: boolean;
   readonly target: string | null;
@@ -27,7 +36,7 @@ interface DoctorProviderState {
 interface DoctorScopeInput {
   readonly checks: readonly DoctorCheck[];
   readonly registrations: readonly ClientRegistrationStatus[];
-  readonly skillState: "aligned" | "stale" | "missing";
+  readonly skillState: DoctorSkillState;
   readonly providers: DoctorProviderState;
   readonly scope: DoctorScopeReport;
 }
@@ -39,6 +48,9 @@ export const normalizeDoctorScope = (
 ): DoctorScopeReport => ({
   mode: requested === undefined ? "audit-wide" : "explicit",
   clients: uniqueSorted(requested?.clients ?? []),
+  ...(requested?.skillClients === undefined
+    ? {}
+    : { skill_clients: uniqueSorted(requested.skillClients) }),
   providers: uniqueSorted(requested?.providers ?? []),
   skill: requested?.skill === true,
   target: target ?? null,
@@ -57,9 +69,7 @@ export const scopeDoctorChecks = (
   );
   const coreChecks = input.checks.filter(
     ({ name }) =>
-      !isProviderCheck(name, input.providers.providerInspections) &&
-      name !== "skill:identity" &&
-      !name.startsWith("registration:"),
+      name === "node" || (input.scope.target !== null && name === "target"),
   );
   const clientChecks = input.scope.clients.map((client) =>
     selectedRegistrationCheck(
@@ -67,44 +77,83 @@ export const scopeDoctorChecks = (
       input.registrations.find((candidate) => candidate.client === client),
     ),
   );
+  const environmentChecks = input.checks.filter((check) =>
+    registrationEnvironmentInScope(check, input.scope),
+  );
   const skillChecks = input.scope.skill
     ? [selectedSkillCheck(input.skillState, input.checks)]
     : [];
-  const selectedProviderChecks =
-    input.scope.providers.length === 0
-      ? configuredProviderChecks(providerChecks, input.providers)
-      : input.scope.providers.flatMap((providerId) =>
-          selectedProviderChecksFor(
-            providerId,
-            providerChecks,
-            input.providers,
-          ),
-        );
+  const selectedProviderChecks = input.scope.providers.flatMap((providerId) =>
+    providerId === DESKTOP_BUILD_PROVIDER_ID
+      ? requiredDesktopBuildChecks(input.checks)
+      : selectedProviderChecksFor(providerId, providerChecks, input.providers),
+  );
+  const hopperHostChecks = input.scope.providers.includes("hopper")
+    ? input.checks.filter(({ name }) => name === "host")
+    : [];
+  // parseConfig rejects these before the MCP server starts. Hopper's own
+  // scope already includes hopper-startup-timeout through its provider checks.
+  const blocksMcpStartup = (check: DoctorCheck): boolean =>
+    check.name.startsWith("runtime-configuration:") ||
+    check.name === "hopper-startup-timeout";
+  const blocksProcess = (check: DoctorCheck): boolean => {
+    const setting = check.details?.setting;
+    return (
+      check.name.startsWith("runtime-configuration:") &&
+      typeof setting === "string" &&
+      blocksProcessStart(setting)
+    );
+  };
+  const exercisesMcpStartup =
+    input.scope.clients.length > 0 || input.scope.providers.length > 0;
+  const startupChecks = (
+    exercisesMcpStartup
+      ? input.checks.filter(blocksMcpStartup)
+      : input.checks.filter(blocksProcess)
+  ).filter(
+    (check) =>
+      check.name !== "hopper-startup-timeout" ||
+      !input.scope.providers.includes("hopper"),
+  );
   const scopeChecks = [
     ...coreChecks,
+    ...startupChecks,
+    ...hopperHostChecks,
     ...selectedProviderChecks,
     ...clientChecks,
+    ...environmentChecks,
     ...skillChecks,
   ];
-  const providerHealthy =
-    input.scope.providers.length === 0
-      ? doctorHealthy(
-          [...coreChecks, ...providerChecks, ...clientChecks, ...skillChecks],
-          input.providers,
-        )
-      : selectedProviderChecks.every(({ ok }) => ok);
   const selectedNames = new Set(scopeChecks.map(({ name }) => name));
   return {
     healthy:
       coreChecks.every(({ ok }) => ok) &&
+      startupChecks.every(({ ok }) => ok) &&
+      hopperHostChecks.every(({ ok }) => ok) &&
       clientChecks.every(({ ok }) => ok) &&
       skillChecks.every(({ ok }) => ok) &&
-      providerHealthy,
+      selectedProviderChecks.every(({ ok }) => ok),
     scopeChecks,
     informationalChecks: input.checks.filter(
       ({ name }) => !selectedNames.has(name),
     ),
   };
+};
+
+/** Follow the caller's question: a named client, or a provider it relies on. */
+const registrationEnvironmentInScope = (
+  { name, details }: DoctorCheck,
+  scope: DoctorScopeReport,
+): boolean => {
+  const [family, client] = name.split(":");
+  if (family !== "registration_environment" || client === undefined)
+    return false;
+  const providers = details?.providers;
+  return (
+    scope.clients.includes(client) ||
+    (Array.isArray(providers) &&
+      scope.providers.some((provider) => providers.includes(provider)))
+  );
 };
 
 const isProviderCheck = (
@@ -113,19 +162,6 @@ const isProviderCheck = (
 ): boolean =>
   name.startsWith("hopper") ||
   inspections?.some(({ id }) => doctorProviderCheckName(id, name)) === true;
-
-const configuredProviderChecks = (
-  checks: readonly DoctorCheck[],
-  providers: DoctorProviderState,
-): readonly DoctorCheck[] =>
-  checks.filter(({ name }) =>
-    name.startsWith("hopper")
-      ? providers.hopperConfigured
-      : providers.providerInspections?.some(
-          ({ id, configured }) =>
-            configured && doctorProviderCheckName(id, name),
-        ) === true,
-  );
 
 const selectedProviderChecksFor = (
   providerId: string,
@@ -156,11 +192,41 @@ const selectedProviderChecksFor = (
   ];
 };
 
+/** Informational desktop build checks stay outside the scope that decides health. */
+const requiredDesktopBuildChecks = (
+  checks: readonly DoctorCheck[],
+): readonly DoctorCheck[] => {
+  const required = checks.filter(
+    ({ name }) =>
+      isDesktopBuildCheck(name) && !isDesktopBuildInformationalCheck(name),
+  );
+  return required.length > 0
+    ? required
+    : [
+        {
+          name: `provider:${DESKTOP_BUILD_PROVIDER_ID}`,
+          ok: false,
+          classification: "unknown",
+          detail: "This doctor host does not check desktop build hosts.",
+          remediation: "Run rea doctor --provider desktop_build from the CLI.",
+        },
+      ];
+};
+
 const selectedRegistrationCheck = (
   client: string,
   status: ClientRegistrationStatus | undefined,
-): DoctorCheck =>
-  status === undefined
+): DoctorCheck => {
+  const manual = manualRegistrationRemediation(client);
+  if (status === undefined && manual !== undefined)
+    return {
+      name: `registration:${client}`,
+      ok: false,
+      classification: "config_drift",
+      detail: `${client} is not registered through a local configuration file.`,
+      remediation: manual,
+    };
+  return status === undefined
     ? {
         name: `registration:${client}`,
         ok: false,
@@ -176,13 +242,14 @@ const selectedRegistrationCheck = (
           detail: status.config_path,
         }
       : registrationCheck(status);
+};
 
 const registrationCheck = (
   status: UnhealthyClientRegistrationStatus,
 ): DoctorCheck => ({
   name: `registration:${status.client}`,
   ok: false,
-  classification: "config_drift",
+  classification: status.state === "unknown" ? "unknown" : "config_drift",
   detail: status.config_path,
   remediation: status.remediation,
 });
@@ -194,14 +261,23 @@ const selectedSkillCheck = (
   checks.find(({ name }) => name === "skill:identity") ?? {
     name: "skill:identity",
     ok: state === "aligned",
-    classification: state === "aligned" ? "healthy" : "config_drift",
+    classification:
+      state === "aligned"
+        ? "healthy"
+        : state === "unknown"
+          ? "unknown"
+          : "config_drift",
     ...(state === "aligned"
       ? { detail: "Installed REA skill identity is aligned." }
-      : { remediation: "Run rea setup to update the installed REA skill." }),
+      : {
+          remediation:
+            state === "unmanaged"
+              ? "Use regular skill directories, or run rea setup with --skill=false to configure the client without installing the skill."
+              : state === "unknown"
+                ? "Verify access to the reported skill files before retrying."
+                : "Run rea setup to update the installed REA skill.",
+        }),
   };
-
-const uniqueSorted = (values: readonly string[]): readonly string[] =>
-  [...new Set(values)].sort((left, right) => left.localeCompare(right));
 
 const doctorProviderCheckName = (providerId: string, name: string): boolean =>
   name === providerId || name.startsWith(`${providerId}-`);

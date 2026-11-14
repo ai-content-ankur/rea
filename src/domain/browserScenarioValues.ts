@@ -1,25 +1,28 @@
 import { z } from "zod";
 
+import { IDENTIFIER_PATTERN } from "./stringPatterns.js";
+import { jsonValueSchema } from "./jsonValue.js";
+
+import { absoluteLocalPathStringSchema } from "./localPath.js";
+import { browserNetworkContentSelectionSchema } from "./browserNetworkEvidence.js";
+import { browserScenarioEventFamilySchema } from "./browserScenarioCaptureValues.js";
 import {
-  browserAllowedOriginsSchema,
+  browserScenarioCaptureLimitsSchema,
+  DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
+} from "./browserScenarioCaptureLimits.js";
+
+import {
   browserEndpointSchema,
   browserOriginSchema,
 } from "./browserObservation.js";
 
-export const scenarioIdentifierSchema = z
-  .string()
-  .regex(/^[A-Za-z][A-Za-z0-9._-]*$/u);
+export const scenarioIdentifierSchema = z.string().regex(IDENTIFIER_PATTERN);
 
-const absoluteExecutablePathSchema = z
-  .string()
-  .min(1)
-  .refine(
-    (value) =>
-      value.startsWith("/") ||
-      /^[A-Za-z]:[\\/]/u.test(value) ||
-      value.startsWith("\\\\"),
-    "Expected an absolute browser executable path",
-  );
+/**
+ * Step identity the provider owns for the initial-state step. Callers cannot
+ * claim it, because two capture steps with one identity cannot be aligned.
+ */
+export const BROWSER_SCENARIO_START_STEP_ID = "scenario_start";
 
 const browserScenarioBaseUrlSchema = z
   .string()
@@ -28,21 +31,20 @@ const browserScenarioBaseUrlSchema = z
     let url: URL;
     try {
       url = new URL(value);
-    } catch {
+    } catch (cause: unknown) {
+      // Invalid input is reported through the zod issue.
+      void cause;
       context.addIssue({ code: "custom", message: "Invalid browser URL" });
       return z.NEVER;
     }
     if (
       (url.protocol !== "http:" && url.protocol !== "https:") ||
       url.username !== "" ||
-      url.password !== "" ||
-      url.search !== "" ||
-      url.hash !== ""
+      url.password !== ""
     ) {
       context.addIssue({
         code: "custom",
-        message:
-          "Browser URLs must be HTTP(S), omit credentials, and declare query values separately",
+        message: "Browser URLs must be HTTP(S) and omit credentials",
       });
       return z.NEVER;
     }
@@ -53,7 +55,6 @@ export const browserScenarioValueSchema = z.discriminatedUnion("source", [
   z.strictObject({
     source: z.literal("literal"),
     value: z.string(),
-    classification: z.literal("public"),
   }),
   z.strictObject({
     source: z.literal("secret"),
@@ -67,7 +68,192 @@ const queryEntrySchema = z.strictObject({
   value: browserScenarioValueSchema,
 });
 
-/** URL whose values remain explicit public literals or declared secret references. */
+/** HTTP methods a request step may send. */
+export const BROWSER_SCENARIO_REQUEST_METHODS = [
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+] as const;
+
+/** Header names a page's fetch cannot set (and User-Agent, which Chrome drops), so a request step refuses them rather than having them dropped. */
+const FORBIDDEN_REQUEST_HEADERS = new Set([
+  "accept-charset",
+  "accept-encoding",
+  "access-control-request-headers",
+  "access-control-request-method",
+  "connection",
+  "content-length",
+  "cookie",
+  "cookie2",
+  "date",
+  "dnt",
+  "expect",
+  "host",
+  "keep-alive",
+  "origin",
+  "referer",
+  "set-cookie",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "user-agent",
+  "via",
+]);
+
+/** Characters an HTTP field value may carry: visible ASCII, space, tab and obs-text. */
+export const HEADER_FIELD_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/u;
+
+const settableRequestHeader = (name: string): boolean => {
+  const lower = name.toLowerCase();
+  return (
+    !FORBIDDEN_REQUEST_HEADERS.has(lower) &&
+    !lower.startsWith("proxy-") &&
+    !lower.startsWith("sec-")
+  );
+};
+
+/** A header value a request step reads from the page as it runs; it is redacted like a declared secret. */
+const browserScenarioPageValueSchemas = [
+  z.strictObject({
+    source: z.literal("cookie"),
+    name: z
+      .string()
+      .min(1)
+      .describe("Cookie the browser holds for the request URL."),
+  }),
+  z.strictObject({
+    source: z.literal("local_storage"),
+    key: z.string().min(1).describe("Local storage key on the start origin."),
+    json_pointer: z
+      .string()
+      .regex(/^(?:\/.*)?$/u)
+      .optional()
+      .describe(
+        "Parse the stored value as JSON and use the string or number at this pointer; empty selects the whole value.",
+      ),
+  }),
+] as const;
+
+/** A path on the start origin: one leading slash, never `//` or `/\`. Written without look-around or reserved class syntax, so every JSON Schema regex dialect reads it. */
+const START_ORIGIN_PATH = /^\x2F(?:[^\x2F\x5C]|$)/u;
+
+/** `{saved:name}` as written, which sends a saved value in a request path or a JSON body string. */
+export const SAVED_PLACEHOLDER = /\{saved:([A-Za-z][A-Za-z0-9._-]*)\}/gu;
+
+/**
+ * `{saved:name}` in a goto destination's URL, which the scenario schema parsed, so it may spell the braces and the colon
+ * percent-encoded. Other text keeps an encoded spelling as written.
+ */
+export const SAVED_URL_PLACEHOLDER =
+  /(?:\{|%7[Bb])saved(?::|%3[Aa])([A-Za-z][A-Za-z0-9._-]*)(?:\}|%7[Dd])/gu;
+
+/** The saved value names a text's placeholders send, as `placeholder` spells them. */
+export const savedPlaceholderNames = (
+  text: string,
+  placeholder: RegExp = SAVED_PLACEHOLDER,
+): readonly string[] =>
+  [...text.matchAll(placeholder)].map(([, name]) => name!);
+
+/** A value an earlier step saved from a JSON response. */
+const savedValueSchema = z.strictObject({
+  source: z.literal("saved"),
+  name: scenarioIdentifierSchema,
+});
+
+/** A literal, declared secret or saved value a request step sends. */
+export const browserScenarioRequestValueSchema = z.discriminatedUnion(
+  "source",
+  [...browserScenarioValueSchema.options, savedValueSchema],
+);
+export type BrowserScenarioRequestValue = z.infer<
+  typeof browserScenarioRequestValueSchema
+>;
+
+/**
+ * A part of Basic credentials: a literal, declared secret or saved value, or a value read from the page, as a frontend
+ * builds such a header from a login token. The page values carry no descriptions here, since each part repeats them.
+ */
+const basicCredentialPartSchema = z.discriminatedUnion("source", [
+  ...browserScenarioRequestValueSchema.options,
+  z.strictObject({ source: z.literal("cookie"), name: z.string().min(1) }),
+  z.strictObject({
+    source: z.literal("local_storage"),
+    key: z.string().min(1),
+    json_pointer: z
+      .string()
+      .regex(/^(?:\/.*)?$/u)
+      .optional(),
+  }),
+]);
+export type BrowserScenarioCredentialPart = z.infer<
+  typeof basicCredentialPartSchema
+>;
+
+/** Basic auth uses the first colon as the username/password separator. */
+export const validBasicCredentialUsername = (username: string): boolean =>
+  !username.includes(":");
+
+/** A username and password sent as the base64 of `username:password`, as HTTP Basic auth spells them; redacted like a declared secret. */
+const basicCredentialsSchema = z.strictObject({
+  source: z.literal("basic_credentials"),
+  parts: z
+    .array(basicCredentialPartSchema)
+    .length(2)
+    .describe("Username, then password."),
+});
+
+/** A string or number a step keeps from a JSON response, by name, for later steps. */
+const saveEntrySchema = z.strictObject({
+  name: scenarioIdentifierSchema,
+  json_pointer: z.string().regex(/^(?:\/.*)?$/u),
+  secret: z.boolean().default(false),
+});
+export type BrowserScenarioSaveEntry = z.infer<typeof saveEntrySchema>;
+
+/** Values a UI step keeps from a newly observed matching response; matching does not prove causality. */
+const saveResponseSchema = z
+  .strictObject({
+    method: z.enum(BROWSER_SCENARIO_REQUEST_METHODS),
+    path: z
+      .string()
+      .regex(START_ORIGIN_PATH)
+      .describe("`{*}` matches one segment; the query is ignored."),
+    save: z.array(saveEntrySchema).min(1),
+  })
+  .describe(
+    "Save values from a newly observed matching 2xx JSON response; matching does not prove the UI caused it. Multiple observed matches fail.",
+  );
+export type BrowserScenarioSaveResponse = z.infer<typeof saveResponseSchema>;
+
+const requestHeaderSchema = z.strictObject({
+  name: z
+    .string()
+    // Hex escapes retain HTTP token characters in Unicode-set client regexes.
+    .regex(/^[!#$%&'*+.^_`\x7C~0-9A-Za-z\x2D]+$/u)
+    .refine(settableRequestHeader, {
+      message: "A page's fetch cannot set this header",
+    }),
+  value: z.discriminatedUnion("source", [
+    ...browserScenarioValueSchema.options,
+    ...browserScenarioPageValueSchemas,
+    savedValueSchema,
+    basicCredentialsSchema,
+  ]),
+  prefix: z
+    .string()
+    .regex(HEADER_FIELD_VALUE, {
+      message: "A header value cannot carry line breaks or control characters",
+    })
+    .optional()
+    .describe("Text sent before the value, such as `Bearer `."),
+});
+export type BrowserScenarioRequestHeader = z.infer<typeof requestHeaderSchema>;
+
+/** URL with ordinary inline details and optional structured secret query references. */
 export const browserScenarioUrlSchema = z.strictObject({
   url: browserScenarioBaseUrlSchema,
   query: z.array(queryEntrySchema).default([]),
@@ -77,17 +263,20 @@ export type BrowserScenarioUrl = z.infer<typeof browserScenarioUrlSchema>;
 export const browserScenarioBrowserSchema = z.discriminatedUnion("mode", [
   z.strictObject({
     mode: z.literal("launch"),
-    executable_path: absoluteExecutablePathSchema,
-    headless: z.literal(true),
-    user_data: z.literal("temporary-owned"),
-    cleanup: z.literal("close-and-delete-profile"),
+    executable_path: absoluteLocalPathStringSchema.describe(
+      "Absolute local filesystem path for the browser executable; relative paths are rejected.",
+    ),
+    headless: z
+      .boolean()
+      .default(true)
+      .describe(
+        "Run without a visible browser window; defaults to true and can be disabled when the host supports a display.",
+      ),
   }),
   z.strictObject({
     mode: z.literal("connect"),
     cdp_endpoint: browserEndpointSchema,
-    target_id: z.string().trim().min(1),
-    ownership: z.literal("external"),
-    cleanup: z.literal("disconnect-only"),
+    target_id: z.string().min(1),
   }),
 ]);
 
@@ -95,8 +284,8 @@ export const browserScenarioEnvironmentSchema = z
   .strictObject({
     viewport: z
       .strictObject({
-        width: z.number().int().positive().default(1_280),
-        height: z.number().int().positive().default(720),
+        width: z.int().positive().default(1_280),
+        height: z.int().positive().default(720),
         device_scale_factor: z.number().positive().default(1),
       })
       .default({ width: 1_280, height: 720, device_scale_factor: 1 }),
@@ -104,15 +293,18 @@ export const browserScenarioEnvironmentSchema = z
       .string()
       .min(2)
       .regex(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/u)
-      .default("en-US"),
+      .default("en-US")
+      .describe(
+        "Formatting locale. Launch also sets navigator.language(s) and Accept-Language; connect retains the caller's page and request languages and reports this limitation.",
+      ),
     timezone: z
       .string()
       .min(1)
-      .regex(/^[A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*$/u)
+      .regex(/^[A-Za-z0-9_+\x2d]+(?:\x2f[A-Za-z0-9_+\x2d]+)*$/u)
       .default("UTC"),
     color_scheme: z.enum(["light", "dark", "no-preference"]).default("light"),
     reduced_motion: z.enum(["reduce", "no-preference"]).default("reduce"),
-    service_workers: z.literal("block").default("block"),
+    service_workers: z.enum(["allow", "block"]).default("block"),
   })
   .default({
     viewport: { width: 1_280, height: 720, device_scale_factor: 1 },
@@ -150,7 +342,6 @@ const locatorSchema = z.discriminatedUnion("kind", [
       "textbox",
     ]),
     name: z.string().min(1),
-    exact: z.literal(true),
   }),
   z.strictObject({
     kind: z.literal("css"),
@@ -158,12 +349,15 @@ const locatorSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+// Playwright forwards these intervals to Node timers.
+const MAX_BROWSER_SCENARIO_TIMEOUT_MS = 2_147_483_647;
+
 const stepBase = {
   step_id: scenarioIdentifierSchema,
   timeout_ms: z
-    .number()
     .int()
     .min(1)
+    .max(MAX_BROWSER_SCENARIO_TIMEOUT_MS)
     .optional()
     .describe(
       "Optional action deadline in milliseconds; omitted means wait until completion or request cancellation.",
@@ -182,7 +376,8 @@ export const browserScenarioActionSchema = z.discriminatedUnion("action", [
     action: z.literal("click"),
     locator: locatorSchema,
     button: z.enum(["left", "middle", "right"]).default("left"),
-    click_count: z.number().int().positive().default(1),
+    click_count: z.int().positive().default(1),
+    save_response: saveResponseSchema.optional(),
   }),
   z.strictObject({
     ...stepBase,
@@ -195,6 +390,7 @@ export const browserScenarioActionSchema = z.discriminatedUnion("action", [
     action: z.literal("press"),
     locator: locatorSchema,
     key: z.string().min(1),
+    save_response: saveResponseSchema.optional(),
   }),
   z.strictObject({
     ...stepBase,
@@ -214,12 +410,52 @@ export const browserScenarioActionSchema = z.discriminatedUnion("action", [
     state: z.enum(["attached", "detached", "visible", "hidden"]),
   }),
   z.strictObject({
+    ...stepBase,
+    action: z.literal("request"),
+    method: z.enum(BROWSER_SCENARIO_REQUEST_METHODS),
+    path: z
+      .string()
+      .regex(START_ORIGIN_PATH)
+      .describe(
+        "Path, and optional literal query, on the start URL's origin, such as /api/folders; it must resolve to that origin.",
+      ),
+    query: z.array(queryEntrySchema).default([]),
+    headers: z.array(requestHeaderSchema).default([]),
+    json: jsonValueSchema
+      .optional()
+      .describe(
+        "JSON request body, sent with Content-Type application/json unless a header sets one; not allowed for GET or HEAD.",
+      ),
+    save: z
+      .array(saveEntrySchema)
+      .default([])
+      .describe(
+        "Values to save from the JSON response. Later steps send one as `{saved:name}` in a request path, goto URL or JSON string, or as a header value.",
+      ),
+    expected_status: z
+      .array(
+        z
+          .int()
+          .min(100)
+          .max(999)
+          .refine((status) => status < 300 || status > 399, {
+            message:
+              "Request steps follow no redirects, so a 3xx status cannot complete one",
+          }),
+      )
+      .min(1)
+      .optional()
+      .describe(
+        "Statuses that complete the step; any other status fails it. Omitted means any response completes it.",
+      ),
+  }),
+  z.strictObject({
     step_id: scenarioIdentifierSchema,
     action: z.literal("wait_for_timeout"),
     duration_ms: z
-      .number()
       .int()
       .min(1)
+      .max(MAX_BROWSER_SCENARIO_TIMEOUT_MS)
       .describe(
         "Wait this many milliseconds; the wait ends early on cancellation.",
       ),
@@ -265,111 +501,19 @@ export const browserScenarioStorageSchema = z
   })
   .default({ cookies: [], local_storage: [], session_storage: [] })
   .describe(
-    "Optional initial cookies, local storage, or session storage. Defaults to empty; every supplied value and origin must be explicitly declared and approved.",
-  );
-
-const headerNameSchema = z
-  .string()
-  .min(1)
-  .regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u)
-  .transform((value) => value.toLowerCase());
-
-const replayHeaderSchema = z.strictObject({
-  name: headerNameSchema,
-  value: browserScenarioValueSchema,
-});
-
-const replayResponseSchema = z.discriminatedUnion("kind", [
-  z.strictObject({
-    kind: z.literal("response"),
-    status: z.number().int().min(100).max(599),
-    headers: z.array(replayHeaderSchema).default([]),
-    body: browserScenarioValueSchema.optional(),
-  }),
-  z.strictObject({
-    kind: z.literal("redirect"),
-    status: z.union([
-      z.literal(301),
-      z.literal(302),
-      z.literal(303),
-      z.literal(307),
-      z.literal(308),
-    ]),
-    destination: browserScenarioUrlSchema,
-  }),
-]);
-
-const replayRouteSchema = z.strictObject({
-  route_id: scenarioIdentifierSchema,
-  method: z.enum(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]),
-  request: browserScenarioUrlSchema,
-  response: replayResponseSchema,
-});
-
-export const browserScenarioRequestReplaySchema = z
-  .discriminatedUnion("mode", [
-    z.strictObject({ mode: z.literal("disabled") }),
-    z.strictObject({
-      mode: z.literal("exact"),
-      unmatched: z.enum(["abort", "passthrough-approved-origins"]),
-      routes: z.array(replayRouteSchema).min(1),
-    }),
-  ])
-  .default({ mode: "disabled" })
-  .describe(
-    "Optional exact request replay. Defaults to disabled; replay routes and unmatched-request behavior must be explicitly declared when enabled.",
+    "Optional initial cookies, local storage, or session storage. Defaults to empty; every supplied value and origin must be declared and within the allowed origins.",
   );
 
 export const browserScenarioSecretSchema = z.strictObject({
   secret_id: scenarioIdentifierSchema,
-  environment_variable: z.string().regex(/^[A-Z_][A-Z0-9_]*$/u),
-  purpose: z.enum(["input", "storage", "request-replay"]),
-  redaction: z.literal("replace-with-secret-reference"),
+  environment_variable: z
+    .string()
+    .min(1)
+    .refine(
+      (name) => !name.includes("=") && !name.includes("\0"),
+      "Environment variable names cannot contain '=' or NUL",
+    ),
 });
-
-const REQUIRED_REDACTED_HEADERS = [
-  "authorization",
-  "cookie",
-  "proxy-authorization",
-  "set-cookie",
-] as const;
-
-const normalizedNames = () =>
-  z
-    .array(
-      z
-        .string()
-        .trim()
-        .min(1)
-        .transform((value) => value.toLowerCase()),
-    )
-    .transform((values) => [...new Set(values)].sort());
-
-export const browserScenarioRedactionSchema = z
-  .strictObject({
-    secret_values: z
-      .literal("replace-with-secret-reference")
-      .default("replace-with-secret-reference"),
-    query_parameter_names: normalizedNames().default([]),
-    header_names: normalizedNames().default([...REQUIRED_REDACTED_HEADERS]),
-  })
-  .superRefine(({ header_names: names }, context) => {
-    for (const required of REQUIRED_REDACTED_HEADERS)
-      if (!names.includes(required))
-        context.addIssue({
-          code: "custom",
-          path: ["header_names"],
-          message: `Required credential header ${required} must be redacted`,
-        });
-  })
-  .default({
-    secret_values: "replace-with-secret-reference",
-    query_parameter_names: [],
-    header_names: [...REQUIRED_REDACTED_HEADERS],
-  })
-  .describe(
-    "Redaction policy. Secret values and credential headers are always redacted; list query parameter names when a secret is used in a URL.",
-  );
 
 const snapshotKindSchema = z.enum([
   "screenshot",
@@ -384,24 +528,23 @@ export const browserScenarioCaptureSchema = z
   .strictObject({
     after_each_step: z.array(snapshotKindSchema).default([]),
     at_end: z.array(snapshotKindSchema).default(["url"]),
-    events: z
-      .array(
-        z.enum([
-          "console",
-          "page-errors",
-          "network",
-          "websockets",
-          "frames",
-          "workers",
-          "popups",
-          "downloads",
-        ]),
-      )
-      .default([]),
+    events: z.array(browserScenarioEventFamilySchema).default([]),
+    network: browserNetworkContentSelectionSchema,
+    limits: browserScenarioCaptureLimitsSchema.default(
+      DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
+    ),
   })
-  .default({ after_each_step: [], at_end: ["url"], events: [] })
+  .default({
+    after_each_step: [],
+    at_end: ["url"],
+    events: [],
+    network: {
+      request_body: false,
+      response_body: false,
+      header_values: false,
+    },
+    limits: DEFAULT_BROWSER_SCENARIO_CAPTURE_LIMITS,
+  })
   .describe(
     "Optional retained artifacts and event families. Defaults to only a final sanitized URL; request screenshots, DOM, accessibility, history, storage, and event capture explicitly.",
   );
-
-export const browserScenarioAllowedOriginsSchema = browserAllowedOriginsSchema;

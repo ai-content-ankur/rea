@@ -4,13 +4,17 @@ import { z } from "zod";
 
 import {
   parseEvidenceBundle,
+  referencedEvidenceIds,
   serializeEvidenceBundle,
   type EvidenceBundle,
 } from "./evidenceBundle.js";
+import { AnalysisInputError } from "./analysisErrorCore.js";
 import type { ResidualUnknown } from "./residualUnknown.js";
+import { digestSchema, prefixedDigestSchema } from "./../domain/digests.js";
+import { comparisonStatusSchema } from "./comparisonStatus.js";
+import { localPathStringSchema } from "./localPath.js";
 
-const evidenceIdSchema = z.string().regex(/^ev_[a-f0-9]{64}$/u);
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const evidenceIdSchema = prefixedDigestSchema("ev");
 const classificationSchema = z.enum([
   "added",
   "removed",
@@ -22,8 +26,8 @@ const classificationSchema = z.enum([
 
 /** Strict input for canonical Evidence bundle comparison. */
 export const bundleComparisonInputSchema = z.strictObject({
-  left_bundle_path: z.string().min(1),
-  right_bundle_path: z.string().min(1),
+  left_bundle_path: localPathStringSchema,
+  right_bundle_path: localPathStringSchema,
   record_pairs: z
     .array(
       z.object({
@@ -52,20 +56,20 @@ const bundleChangeSchema = z.object({
 
 /** Deterministic classified delta between two canonical Evidence bundles. */
 export const bundleComparisonResultSchema = z.object({
-  status: z.enum(["unchanged", "changed", "unknown"]),
+  status: comparisonStatusSchema,
   left_bundle_sha256: digestSchema,
   right_bundle_sha256: digestSchema,
   summary: z.object({
-    records_unchanged: z.number().int().min(0),
-    records_added: z.number().int().min(0),
-    records_removed: z.number().int().min(0),
-    records_changed: z.number().int().min(0),
-    unknowns_unchanged: z.number().int().min(0),
-    unknowns_added: z.number().int().min(0),
-    unknowns_removed: z.number().int().min(0),
-    unknowns_advanced: z.number().int().min(0),
-    unknowns_diverged: z.number().int().min(0),
-    unresolved: z.number().int().min(0),
+    records_unchanged: z.int().min(0),
+    records_added: z.int().min(0),
+    records_removed: z.int().min(0),
+    records_changed: z.int().min(0),
+    unknowns_unchanged: z.int().min(0),
+    unknowns_added: z.int().min(0),
+    unknowns_removed: z.int().min(0),
+    unknowns_advanced: z.int().min(0),
+    unknowns_diverged: z.int().min(0),
+    unresolved: z.int().min(0),
   }),
   changes: z.array(bundleChangeSchema),
   limitations: z.array(z.string()),
@@ -75,7 +79,7 @@ export type BundleComparisonResult = z.infer<
   typeof bundleComparisonResultSchema
 >;
 type BundleChange = z.infer<typeof bundleChangeSchema>;
-type RecordPair = z.infer<
+export type BundleRecordPair = z.infer<
   typeof bundleComparisonInputSchema
 >["record_pairs"][number];
 
@@ -83,7 +87,7 @@ type RecordPair = z.infer<
 export const compareBundles = (
   leftInput: unknown,
   rightInput: unknown,
-  recordPairs: readonly RecordPair[] = [],
+  recordPairs: readonly BundleRecordPair[] = [],
 ): BundleComparisonResult => {
   const left = parseEvidenceBundle(leftInput);
   const right = parseEvidenceBundle(rightInput);
@@ -99,11 +103,7 @@ export const compareBundles = (
   ).length;
   return bundleComparisonResultSchema.parse({
     status:
-      leftDigest === rightDigest && changes.length === 0
-        ? "unchanged"
-        : unresolved > 0
-          ? "unknown"
-          : "changed",
+      unresolved > 0 ? "unknown" : changes.length > 0 ? "changed" : "unchanged",
     left_bundle_sha256: leftDigest,
     right_bundle_sha256: rightDigest,
     summary: {
@@ -114,7 +114,7 @@ export const compareBundles = (
     changes,
     limitations: changes.some(({ limitations }) => limitations.length > 0)
       ? [
-          "One-sided membership proves only bundle inclusion or omission, not behavioral absence.",
+          "EvidenceBundle has no inventory completeness marker; one-sided membership remains unknown.",
         ]
       : [],
   });
@@ -123,7 +123,7 @@ export const compareBundles = (
 const compareRecords = (
   left: EvidenceBundle,
   right: EvidenceBundle,
-  pairs: readonly RecordPair[],
+  pairs: readonly BundleRecordPair[],
 ) => {
   const leftIds = new Set(left.records.map(({ evidence_id: id }) => id));
   const rightIds = new Set(right.records.map(({ evidence_id: id }) => id));
@@ -131,20 +131,31 @@ const compareRecords = (
   const pairedRight = new Set<string>();
   const changes: BundleChange[] = [];
   let changed = 0;
-  for (const pair of pairs) {
+  for (const [index, pair] of pairs.entries()) {
     if (!leftIds.has(pair.left_evidence_id))
-      throw new TypeError(
+      throw recordPairFailure(
+        index,
+        "left_evidence_id",
         `Explicit pair references missing left evidence ${pair.left_evidence_id}`,
       );
     if (!rightIds.has(pair.right_evidence_id))
-      throw new TypeError(
+      throw recordPairFailure(
+        index,
+        "right_evidence_id",
         `Explicit pair references missing right evidence ${pair.right_evidence_id}`,
       );
-    if (
-      pairedLeft.has(pair.left_evidence_id) ||
-      pairedRight.has(pair.right_evidence_id)
-    )
-      throw new TypeError("Explicit evidence pairs must be one-to-one");
+    if (pairedLeft.has(pair.left_evidence_id))
+      throw recordPairFailure(
+        index,
+        "left_evidence_id",
+        "Explicit evidence pairs must be one-to-one",
+      );
+    if (pairedRight.has(pair.right_evidence_id))
+      throw recordPairFailure(
+        index,
+        "right_evidence_id",
+        "Explicit evidence pairs must be one-to-one",
+      );
     pairedLeft.add(pair.left_evidence_id);
     pairedRight.add(pair.right_evidence_id);
     if (pair.left_evidence_id === pair.right_evidence_id) continue;
@@ -165,39 +176,48 @@ const compareRecords = (
     (id) => rightIds.has(id) && !pairedLeft.has(id) && !pairedRight.has(id),
   );
   const removed = [...leftIds].filter(
-    (id) => !rightIds.has(id) && !pairedLeft.has(id),
+    (id) => !pairedLeft.has(id) && (!rightIds.has(id) || pairedRight.has(id)),
   );
   const added = [...rightIds].filter(
-    (id) => !leftIds.has(id) && !pairedRight.has(id),
+    (id) => !pairedRight.has(id) && (!leftIds.has(id) || pairedLeft.has(id)),
   );
-  for (const [classification, ids, side] of [
-    ["removed", removed, "left"],
-    ["added", added, "right"],
+  for (const [ids, side] of [
+    [removed, "left"],
+    [added, "right"],
   ] as const)
     for (const id of ids)
       changes.push({
         entity: "evidence",
         key: id,
-        classification,
-        conclusion_kind: "observed_change",
+        classification: "unknown",
+        conclusion_kind: "unresolved_branch",
         left_evidence_ids: side === "left" ? [id] : [],
         right_evidence_ids: side === "right" ? [id] : [],
         left_digest: side === "left" ? id.slice(3) : null,
         right_digest: side === "right" ? id.slice(3) : null,
         limitations: [
-          "One-sided membership does not establish behavioral absence.",
+          "EvidenceBundle has no inventory completeness marker; one-sided membership may reflect incomplete capture.",
         ],
       });
   return {
     changes,
     summary: {
       records_unchanged: common.length + pairs.length - changed,
-      records_added: added.length,
-      records_removed: removed.length,
+      records_added: 0,
+      records_removed: 0,
       records_changed: changed,
     },
   };
 };
+
+const recordPairFailure = (
+  index: number,
+  field: keyof BundleRecordPair,
+  message: string,
+): AnalysisInputError =>
+  new AnalysisInputError("compare_bundles", { userMessage: message }, [
+    { path: ["record_pairs", index, field], reason: "invalid_value", message },
+  ]);
 
 const compareUnknowns = (left: EvidenceBundle, right: EvidenceBundle) => {
   const leftHistories = histories(left.unknowns);
@@ -215,16 +235,7 @@ const compareUnknowns = (left: EvidenceBundle, right: EvidenceBundle) => {
     const leftHistory = leftHistories.get(id);
     const rightHistory = rightHistories.get(id);
     if (leftHistory === undefined || rightHistory === undefined) {
-      const added = leftHistory === undefined;
-      summary[added ? "unknowns_added" : "unknowns_removed"] += 1;
-      changes.push(
-        unknownChange(
-          id,
-          added ? "added" : "removed",
-          leftHistory,
-          rightHistory,
-        ),
-      );
+      changes.push(unknownChange(id, "unknown", leftHistory, rightHistory));
       continue;
     }
     const leftDigests = leftHistory.map(
@@ -274,7 +285,9 @@ const unknownChange = (
   right_digest: right?.at(-1)?.revision_digest ?? null,
   limitations:
     left === undefined || right === undefined
-      ? ["A missing unknown history does not establish resolution."]
+      ? [
+          "EvidenceBundle has no inventory completeness marker; one-sided history membership remains unknown.",
+        ]
       : [],
 });
 
@@ -289,16 +302,7 @@ const histories = (unknowns: readonly ResidualUnknown[]) => {
 };
 
 const historyEvidenceIds = (history: readonly ResidualUnknown[]): string[] =>
-  [
-    ...new Set(
-      history.flatMap((item) => [
-        ...item.supporting_evidence_ids,
-        ...item.contradicting_evidence_ids,
-        ...item.mutation_evidence_ids,
-        ...(item.resolution?.evidence_ids ?? []),
-      ]),
-    ),
-  ].sort(ascii);
+  [...new Set(history.flatMap(referencedEvidenceIds))].sort(ascii);
 
 const bundleDigest = (bundle: EvidenceBundle): string =>
   createHash("sha256").update(serializeEvidenceBundle(bundle)).digest("hex");
